@@ -1,14 +1,18 @@
 /**
- * Embedded LanceDB memory.
+ * Embedded LanceDB memory with souls.
  *
- * One local LanceDB table stores text notes with a vector per note. The plugin
- * exposes the table as the `lancedb` Host service and registers five agent
- * tools: store, search, forget, list, and stats.
+ * Storage is one local LanceDB table. Every row carries a `scope`:
+ *
+ *   session:<id>   the working memory of one conversation, isolated by default
+ *   soul:<name>    a curated, reusable memory domain the user promotes into
+ *
+ * A session recalls its own notes plus the souls it attached. Nothing crosses
+ * that boundary unless `lancedb_promote` copies a note into a soul.
  *
  * Retrieval is hybrid: cosine vector search plus BM25 full-text search (ICU
- * tokenizer, so Chinese is segmented by dictionary), fused with reciprocal
- * rank fusion. Fused scores are then nudged by recency decay and importance,
- * and recalled rows are reinforced by an access counter.
+ * tokenizer, so Chinese is segmented by dictionary), weighted by the configured
+ * vector/BM25 balance, then nudged by recency and importance. Recalled rows are
+ * reinforced with an access counter.
  *
  * Vectors come from a deterministic local hash embedder by default, so the
  * plugin works offline and with Chinese text (character bigrams). Setting
@@ -19,9 +23,9 @@
  */
 
 import { createHash } from 'node:crypto'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { connect, Index } from '@lancedb/lancedb'
 
 /** Cordis plugin name. */
@@ -32,8 +36,14 @@ export const inject = ['tools']
 
 const ID_PATTERN = /^[0-9a-f]{32}$/u
 const TABLE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u
+const SOUL_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/u
 const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+/gu
 const WORD = /[a-z0-9][a-z0-9_'-]*/gu
+
+const SESSION_PREFIX = 'session:'
+const SOUL_PREFIX = 'soul:'
+/** Soul that receives rows written by v0.2, which had no scope at all. */
+const IMPORTED_SOUL = 'imported'
 
 /** Query cap shared by the tools and the service. */
 const MAX_LIMIT = 50
@@ -45,6 +55,8 @@ const MAX_METADATA = 8_192
 const DAY_MS = 86_400_000
 /** Candidate pool is at least this wide, so small limits still rank well. */
 const MIN_POOL = 12
+/** One promote call stays small enough to report item by item. */
+const MAX_PROMOTE_IDS = 50
 
 /**
  * Resolve and validate the row config. Throws before any tool registers, so a
@@ -68,6 +80,11 @@ function resolveSettings(raw) {
     throw new Error(`dsh-lancedb-memory: topK 必须是 1-${MAX_LIMIT} 的整数，收到 ${JSON.stringify(topK)}`)
   }
 
+  const sessionTtlDays = config.sessionTtlDays ?? 0
+  if (typeof sessionTtlDays !== 'number' || !Number.isFinite(sessionTtlDays) || sessionTtlDays < 0) {
+    throw new Error(`dsh-lancedb-memory: sessionTtlDays 必须是非负数，收到 ${JSON.stringify(sessionTtlDays)}`)
+  }
+
   const directory = typeof config.directory === 'string' && config.directory.length > 0
     ? resolve(config.directory)
     : join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'lancedb')
@@ -76,6 +93,7 @@ function resolveSettings(raw) {
     table,
     topK,
     directory,
+    sessionTtlDays,
     embedding: resolveEmbedding(embedding),
     search: {
       vectorWeight: ratio(search.vectorWeight, 0.7, 'search.vectorWeight'),
@@ -269,7 +287,61 @@ async function httpEmbed(text, settings, apiKey) {
 }
 
 /**
- * The LanceDB table, its hybrid index, and the queue that serializes writes.
+ * A tiny JSON file with atomic writes, used for the soul registry and the
+ * session attachments.
+ */
+class JsonStore {
+  #file
+  #data
+  #loading
+  #writing = Promise.resolve()
+
+  /** @param {string} file - Absolute path. */
+  constructor(file) {
+    this.#file = file
+  }
+
+  /**
+   * Read the current value, defaulting to an empty object.
+   * @returns Parsed object.
+   */
+  async read() {
+    if (this.#data !== undefined) return this.#data
+    this.#loading ??= (async () => {
+      try {
+        const parsed = JSON.parse(await readFile(this.#file, 'utf8'))
+        this.#data = isRecord(parsed) ? parsed : {}
+      } catch {
+        this.#data = {}
+      }
+      return this.#data
+    })()
+    return this.#loading
+  }
+
+  /**
+   * Replace the whole file, serialized with other writes.
+   * @param {(current: Record<string, any>) => Record<string, any>} mutate - Pure update.
+   * @returns The stored value.
+   */
+  async update(mutate) {
+    const run = this.#writing.then(async () => {
+      const current = await this.read()
+      const next = mutate(current)
+      await mkdir(dirname(this.#file), { recursive: true })
+      const temporary = `${this.#file}.${process.pid}.tmp`
+      await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+      await rename(temporary, this.#file)
+      this.#data = next
+      return next
+    })
+    this.#writing = run.then(() => undefined, () => undefined)
+    return run
+  }
+}
+
+/**
+ * The LanceDB table, the soul registry, and the session attachments.
  */
 class MemoryStore {
   #settings
@@ -282,11 +354,15 @@ class MemoryStore {
   #ftsReady = false
   #ftsAttempted = false
   #ftsError
+  #soulsFile
+  #sessionsFile
 
   /** @param {ReturnType<typeof resolveSettings>} settings - Resolved config. */
   constructor(settings) {
     this.#settings = settings
     this.#embedder = createEmbedder(settings.embedding)
+    this.#soulsFile = new JsonStore(join(settings.directory, 'souls.json'))
+    this.#sessionsFile = new JsonStore(join(settings.directory, 'sessions.json'))
   }
 
   /** Stable description of the table, embedder, and retrieval mode. */
@@ -337,9 +413,8 @@ class MemoryStore {
   }
 
   /**
-   * Add the lifecycle columns to an older table. Rows written by v0.1 already
-   * carry `createdAt`, so new columns can be derived from it. Concurrent callers
-   * share one migration.
+   * Add the scope column to a v0.2 table (its rows become the `imported` soul),
+   * plus the lifecycle columns. Concurrent callers share one migration.
    * @param {any} table - Open table.
    */
   async #migrate(table) {
@@ -357,8 +432,18 @@ class MemoryStore {
       if (!names.has('updatedAt')) {
         added.push({ name: 'updatedAt', valueSql: names.has('createdAt') ? 'createdAt' : `${now}` })
       }
+      if (!names.has('scope')) added.push({ name: 'scope', valueSql: `'${soulScope(IMPORTED_SOUL)}'` })
       if (added.length > 0) await table.addColumns(added)
       this.#migrated = true
+      if (added.some(column => column.name === 'scope')) {
+        const imported = await table.countRows(`scope = '${escapeSql(soulScope(IMPORTED_SOUL))}'`)
+        if (imported > 0) {
+          await this.#writeSoul(IMPORTED_SOUL, {
+            description: '从 v0.2 全局记忆迁移过来的内容',
+            keepUpdatedAt: true,
+          })
+        }
+      }
     })().catch((error) => {
       this.#migrating = undefined
       throw error
@@ -396,8 +481,7 @@ class MemoryStore {
   }
 
   /**
-   * Prepare an existing table for reads and writes: lifecycle columns first,
-   * then the BM25 index. Cheap after the first successful call.
+   * Prepare an existing table for reads and writes.
    * @param {any} table - Open table.
    */
   async #prepare(table) {
@@ -406,18 +490,205 @@ class MemoryStore {
   }
 
   /**
-   * Store one note. The same kind and text hash to the same id, and a note that
-   * is already present at `dedupe.threshold` cosine similarity also returns the
-   * existing row instead of adding a near-duplicate.
+   * Read the soul registry.
+   * @returns Soul map keyed by name.
+   */
+  async #souls() {
+    return this.#soulsFile.read()
+  }
+
+  /**
+   * Create or update one soul entry.
+   * @param {string} name - Validated soul name.
+   * @param {{ description: string, keepUpdatedAt?: boolean }} entry - Registry fields.
+   */
+  async #writeSoul(name, entry) {
+    const now = Date.now()
+    await this.#soulsFile.update(current => ({
+      ...current,
+      [name]: {
+        description: entry.description,
+        createdAt: current[name]?.createdAt ?? now,
+        lastUpdatedAt: entry.keepUpdatedAt === true ? current[name]?.lastUpdatedAt ?? now : now,
+      },
+    }))
+  }
+
+  /**
+   * Bump a soul's last activity timestamp.
+   * @param {string} name - Soul name.
+   */
+  async #touchSoul(name) {
+    const souls = await this.#souls()
+    const entry = souls[name]
+    if (entry === undefined) return
+    await this.#soulsFile.update(current => ({
+      ...current,
+      [name]: { ...entry, lastUpdatedAt: Date.now() },
+    }))
+  }
+
+  /**
+   * Reject unknown souls before they reach storage.
+   * @param {string} name - Soul name.
+   */
+  async #requireSoul(name) {
+    const souls = await this.#souls()
+    if (souls[name] === undefined) {
+      throw new Error(`dsh-lancedb-memory: soul "${name}" 不存在，先用 lancedb_souls 建一个`)
+    }
+  }
+
+  /**
+   * Create a soul.
+   * @param {{ name: unknown, description: unknown }} input - Request.
+   * @returns The created soul entry.
+   */
+  async createSoul(input) {
+    const name = normalizeSoulName(input.name)
+    if (typeof input.description !== 'string' || input.description.trim().length === 0) {
+      throw new Error('dsh-lancedb-memory: 新建 soul 要写 description，说明它适合记什么')
+    }
+    const description = input.description.trim().slice(0, 200)
+    return this.#serial(async () => {
+      const souls = await this.#souls()
+      if (souls[name] !== undefined) throw new Error(`dsh-lancedb-memory: soul "${name}" 已存在`)
+      await this.#writeSoul(name, { description })
+      return { soul: name, description, createdAt: Date.now() }
+    })
+  }
+
+  /**
+   * Delete a soul, its rows, and every attachment to it.
+   * @param {{ name: unknown, force: unknown }} input - Request.
+   * @returns Rows removed and sessions detached.
+   */
+  async deleteSoul(input) {
+    const name = normalizeSoulName(input.name)
+    if (input.force !== true) {
+      throw new Error('dsh-lancedb-memory: 删 soul 会连它记住的内容一起删，确认后传 force: true')
+    }
+    return this.#serial(async () => {
+      const souls = await this.#souls()
+      if (souls[name] === undefined) throw new Error(`dsh-lancedb-memory: soul "${name}" 不存在`)
+      const table = await this.#table()
+      let deletedRows = 0
+      if (table !== undefined) {
+        await this.#prepare(table)
+        const before = await table.countRows(`scope = '${escapeSql(soulScope(name))}'`)
+        if (before > 0) await table.delete(`scope = '${escapeSql(soulScope(name))}'`)
+        deletedRows = before
+      }
+      await this.#soulsFile.update(current => {
+        const next = { ...current }
+        delete next[name]
+        return next
+      })
+      let detached = 0
+      await this.#sessionsFile.update(current => {
+        const next = {}
+        for (const [session, entry] of Object.entries(current)) {
+          const previous = Array.isArray(entry?.souls) ? entry.souls : []
+          const kept = previous.filter(item => item !== name)
+          if (kept.length !== previous.length) detached += 1
+          if (kept.length > 0) next[session] = { ...entry, souls: kept }
+        }
+        return next
+      })
+      return { soul: name, deletedRows, detachedSessions: detached }
+    })
+  }
+
+  /**
+   * List souls with row counts and the caller's attachments.
+   * @param {string | undefined} sessionScopeValue - Caller scope, for the attached flag.
+   * @returns Soul catalog.
+   */
+  async soulCatalog(sessionScopeValue) {
+    const souls = await this.#souls()
+    const attached = sessionScopeValue === undefined ? [] : await this.attachedSouls(sessionScopeValue)
+    const counts = new Map()
+    const table = await this.#table()
+    if (table !== undefined) {
+      await this.#prepare(table)
+      const rows = await table.query().select(['scope']).toArray()
+      for (const row of rows) {
+        const name = soulNameOf(row.scope)
+        if (name !== undefined) counts.set(name, (counts.get(name) ?? 0) + 1)
+      }
+    }
+    return {
+      souls: Object.entries(souls)
+        .map(([entryName, entry]) => ({
+          name: entryName,
+          description: entry.description,
+          notes: counts.get(entryName) ?? 0,
+          attached: attached.includes(entryName),
+          createdAt: Number(entry.createdAt),
+          lastUpdatedAt: Number(entry.lastUpdatedAt),
+        }))
+        .sort((left, right) => right.lastUpdatedAt - left.lastUpdatedAt),
+      attached,
+    }
+  }
+
+  /**
+   * Read the souls attached to one session.
+   * @param {string} sessionScopeValue - `session:<id>`.
+   * @returns Attached soul names.
+   */
+  async attachedSouls(sessionScopeValue) {
+    const id = sessionIdOf(sessionScopeValue)
+    if (id === undefined) return []
+    const sessions = await this.#sessionsFile.read()
+    return Array.isArray(sessions[id]?.souls) ? sessions[id].souls : []
+  }
+
+  /**
+   * Attach or detach souls for one session.
+   * @param {string} sessionScopeValue - `session:<id>`.
+   * @param {{ souls: unknown, detach?: unknown }} input - Request.
+   * @returns The resulting attachment list.
+   */
+  async attach(sessionScopeValue, input) {
+    const id = sessionIdOf(sessionScopeValue)
+    if (id === undefined) throw new Error('dsh-lancedb-memory: 只能在会话里挂载 soul')
+    const names = Array.isArray(input.souls) ? input.souls.map(normalizeSoulName) : []
+    const detach = input.detach === true
+    return this.#serial(async () => {
+      const souls = await this.#souls()
+      for (const name of names) {
+        if (souls[name] === undefined) throw new Error(`dsh-lancedb-memory: soul "${name}" 不存在`)
+      }
+      const next = await this.#sessionsFile.update(current => {
+        const previous = Array.isArray(current[id]?.souls) ? current[id].souls : []
+        const merged = detach
+          ? previous.filter(item => !names.includes(item))
+          : [...new Set([...previous, ...names])]
+        const next = { ...current }
+        if (merged.length === 0) delete next[id]
+        else next[id] = { souls: merged, updatedAt: Date.now() }
+        return next
+      })
+      return { attached: next[id]?.souls ?? [] }
+    })
+  }
+
+  /**
+   * Store one note in a scope. Same scope + kind + text hashes to one id, and a
+   * note already present at `dedupe.threshold` similarity returns the old row.
+   * @param {string} scope - `session:<id>` or `soul:<name>`.
    * @param {{ text: string, kind?: string, metadata?: Record<string, unknown>, importance?: number }} input - Note to store.
    * @returns Stored id, row count, and whether a new row was written.
    */
-  async store(input) {
+  async store(scope, input) {
     const text = normalizeText(input.text)
     const kind = normalizeKind(input.kind)
     const metadata = normalizeMetadata(input.metadata)
     const importance = normalizeImportance(input.importance)
-    const id = createHash('sha256').update(`${kind}\u0000${text}`).digest('hex').slice(0, 32)
+    const soul = soulNameOf(scope)
+    if (soul !== undefined) await this.#requireSoul(soul)
+    const id = hashId(scope, kind, text)
     const createdAt = Date.now()
 
     return this.#serial(async () => {
@@ -429,27 +700,28 @@ class MemoryStore {
         const db = await this.#db()
         const created = await db.createTable(this.#settings.table, [{
           id, text, kind, metadata: JSON.stringify(metadata), vector, createdAt, importance,
-          accessCount: 0, lastAccessedAt: createdAt, updatedAt: createdAt,
+          accessCount: 0, lastAccessedAt: createdAt, updatedAt: createdAt, scope,
         }])
         this.#migrated = true
         await this.#ensureFts(created)
-        return { id, kind, created: true, total: await created.countRows(), dimension: vector.length }
+        if (soul !== undefined) await this.#touchSoul(soul)
+        return { id, scope, kind, created: true, total: await created.countRows(), dimension: vector.length }
       }
 
       await this.#prepare(table)
       const found = await table.query().where(`id = '${id}'`).limit(1).toArray()
       if (found.length > 0) {
-        return { id, kind, created: false, total: await table.countRows(), dimension: vector.length }
+        return { id, scope, kind, created: false, total: await table.countRows(), dimension: vector.length }
       }
 
       if (this.#settings.dedupe.enabled) {
         const near = await table.search(vector).limit(1).distanceType('cosine')
-          .where(`kind = '${escapeSql(kind)}'`).toArray()
+          .where(`${scopePredicate([scope])} AND kind = '${escapeSql(kind)}'`).toArray()
           .catch(() => [])
         const similarity = near.length === 0 ? -1 : 1 - near[0]._distance
         if (similarity >= this.#settings.dedupe.threshold) {
           return {
-            id: near[0].id, kind, created: false, duplicate: true,
+            id: near[0].id, scope, kind, created: false, duplicate: true,
             similarity: round(similarity), total: await table.countRows(), dimension: vector.length,
           }
         }
@@ -458,22 +730,23 @@ class MemoryStore {
       try {
         await table.add([{
           id, text, kind, metadata: JSON.stringify(metadata), vector, createdAt, importance,
-          accessCount: 0, lastAccessedAt: createdAt, updatedAt: createdAt,
+          accessCount: 0, lastAccessedAt: createdAt, updatedAt: createdAt, scope,
         }])
       } catch (error) {
         throw await describeWriteFailure(table, vector.length, error)
       }
-      return { id, kind, created: true, total: await table.countRows(), dimension: vector.length }
+      if (soul !== undefined) await this.#touchSoul(soul)
+      return { id, scope, kind, created: true, total: await table.countRows(), dimension: vector.length }
     })
   }
 
   /**
-   * Hybrid search: cosine vectors plus BM25, fused with RRF, then nudged by
-   * recency and importance. Recalled rows are reinforced for the next ranking.
+   * Hybrid search over a set of scopes.
+   * @param {string[]} scopes - Session scope plus attached souls.
    * @param {{ query: string, kind?: string, limit?: number, minScore?: number }} input - Search request.
-   * @returns Ranked matches and the table row count.
+   * @returns Ranked matches.
    */
-  async search(input) {
+  async search(scopes, input) {
     const text = normalizeText(input.query, 'query')
     const kind = input.kind === undefined ? undefined : normalizeKind(input.kind)
     const limit = input.limit ?? this.#settings.topK
@@ -485,19 +758,18 @@ class MemoryStore {
       : ratio(input.minScore, this.#settings.search.minScore, 'minScore')
 
     const table = await this.#table()
-    if (table === undefined) return { results: [], total: 0, table: this.#settings.table, retrieval: 'empty' }
+    if (table === undefined) return { results: [], total: 0, scopes, retrieval: 'empty' }
     await this.#prepare(table)
 
+    const predicate = this.#predicate(scopes, kind)
     const vector = await this.#embedder.embed(text)
     this.#embedder.dimension = vector.length
-    const total = await table.countRows()
+    const total = await table.countRows(predicate)
     const pool = Math.max(limit * 4, MIN_POOL)
 
-    let vectorQuery = table.search(vector).limit(pool).distanceType('cosine')
-    if (kind !== undefined) vectorQuery = vectorQuery.where(`kind = '${escapeSql(kind)}'`)
     let vectorRows = []
     try {
-      vectorRows = await vectorQuery.toArray()
+      vectorRows = await table.search(vector).limit(pool).distanceType('cosine').where(predicate).toArray()
     } catch (error) {
       throw await describeWriteFailure(table, vector.length, error)
     }
@@ -505,11 +777,8 @@ class MemoryStore {
     let ftsRows = []
     if (this.#ftsReady) {
       try {
-        let ftsQuery = table.search(text, 'fts', ['text']).limit(pool)
-        if (kind !== undefined) ftsQuery = ftsQuery.where(`kind = '${escapeSql(kind)}'`)
-        ftsRows = await ftsQuery.toArray()
+        ftsRows = await table.search(text, 'fts', ['text']).limit(pool).where(predicate).toArray()
       } catch {
-        // A broken index must not break recall; vector results still answer.
         ftsRows = []
       }
     }
@@ -531,50 +800,139 @@ class MemoryStore {
     return {
       results: ranked.map(toResult),
       total,
-      table: this.#settings.table,
+      scopes,
       retrieval: this.#ftsReady ? 'hybrid' : 'vector',
     }
   }
 
   /**
-   * Delete one note by the id `store` returned.
-   * @param {string} id - 32 hex characters.
-   * @returns Whether a row was removed.
+   * Copy selected session notes into a soul.
+   * @param {string} sessionScopeValue - Source session scope.
+   * @param {{ ids: unknown, soul: unknown, move?: unknown }} input - Request.
+   * @returns Per-id outcome.
    */
-  async forget(id) {
-    if (typeof id !== 'string' || !ID_PATTERN.test(id)) {
-      throw new Error('dsh-lancedb-memory: id 必须是 lancedb_store 返回的 32 位十六进制字符串')
+  async promote(sessionScopeValue, input) {
+    const soul = normalizeSoulName(input.soul)
+    const ids = Array.isArray(input.ids) ? input.ids : []
+    if (ids.length === 0 || ids.length > MAX_PROMOTE_IDS) {
+      throw new Error(`dsh-lancedb-memory: ids 需要 1-${MAX_PROMOTE_IDS} 个`)
     }
+    for (const id of ids) {
+      if (typeof id !== 'string' || !ID_PATTERN.test(id)) {
+        throw new Error(`dsh-lancedb-memory: id 必须是 32 位十六进制，收到 ${JSON.stringify(id)}`)
+      }
+    }
+    await this.#requireSoul(soul)
+    const target = soulScope(soul)
+    const move = input.move === true
+
     return this.#serial(async () => {
       const table = await this.#table()
-      if (table === undefined) return { id, deleted: false, total: 0 }
-      const before = await table.countRows()
-      await table.delete(`id = '${id}'`)
-      const after = await table.countRows()
-      return { id, deleted: before > after, total: after }
+      if (table === undefined) throw new Error('dsh-lancedb-memory: 记忆库还是空的，没有可 promote 的内容')
+      await this.#prepare(table)
+      const rows = await table.query().where(`id IN (${ids.map(id => `'${id}'`).join(', ')})`).toArray()
+      const byId = new Map(rows.map(row => [row.id, row]))
+      const copied = []
+      const skipped = []
+      const now = Date.now()
+
+      for (const id of ids) {
+        const row = byId.get(id)
+        if (row === undefined || row.scope !== sessionScopeValue) {
+          skipped.push({ id, reason: 'not-in-session' })
+          continue
+        }
+        const nextId = hashId(target, row.kind, row.text)
+        const exact = await table.query().where(`id = '${nextId}'`).limit(1).toArray()
+        if (exact.length > 0) {
+          skipped.push({ id, reason: 'already-in-soul' })
+          continue
+        }
+        if (this.#settings.dedupe.enabled) {
+          const near = await table.search(Array.from(row.vector)).limit(1).distanceType('cosine')
+            .where(`${scopePredicate([target])} AND kind = '${escapeSql(row.kind)}'`).toArray()
+            .catch(() => [])
+          const similarity = near.length === 0 ? -1 : 1 - near[0]._distance
+          if (similarity >= this.#settings.dedupe.threshold) {
+            skipped.push({ id, reason: 'duplicate', similarity: round(similarity) })
+            continue
+          }
+        }
+        await table.add([{
+          id: nextId,
+          text: row.text,
+          kind: row.kind,
+          metadata: row.metadata,
+          vector: Array.from(row.vector),
+          createdAt: Number(row.createdAt),
+          importance: Number(row.importance ?? 5),
+          accessCount: 0,
+          lastAccessedAt: now,
+          updatedAt: now,
+          scope: target,
+        }])
+        copied.push({ id, newId: nextId, text: row.text })
+        if (move) await table.delete(`id = '${id}'`)
+      }
+
+      if (copied.length > 0) await this.#touchSoul(soul)
+      return { soul, copied, skipped, moved: move }
     })
   }
 
   /**
-   * Browse notes newest first, optionally by kind.
+   * Delete one note, but only from the caller's session or an explicitly named
+   * soul.
+   * @param {string} sessionScopeValue - Caller session scope.
+   * @param {{ id: unknown, soul?: unknown }} input - Request.
+   * @returns Whether a row was removed.
+   */
+  async forget(sessionScopeValue, input) {
+    const id = input.id
+    if (typeof id !== 'string' || !ID_PATTERN.test(id)) {
+      throw new Error('dsh-lancedb-memory: id 必须是 lancedb_store 返回的 32 位十六进制字符串')
+    }
+    const soul = input.soul === undefined ? undefined : normalizeSoulName(input.soul)
+    return this.#serial(async () => {
+      const table = await this.#table()
+      if (table === undefined) return { id, deleted: false, total: 0 }
+      const rows = await table.query().where(`id = '${id}'`).limit(1).toArray()
+      const row = rows[0]
+      if (row === undefined) return { id, deleted: false, total: await table.countRows() }
+      const allowed = row.scope === sessionScopeValue
+        || (soul !== undefined && row.scope === soulScope(soul))
+      if (!allowed) {
+        throw new Error('dsh-lancedb-memory: 只能删当前会话里的记忆；删 soul 里的要显式传 soul')
+      }
+      await table.delete(`id = '${id}'`)
+      return { id, deleted: true, total: await table.countRows() }
+    })
+  }
+
+  /**
+   * Browse notes newest first inside one scope.
+   * @param {string} scope - Session or soul scope.
    * @param {{ kind?: string, limit?: number }} input - Listing request.
    * @returns Notes without vectors.
    */
-  async list(input) {
+  async list(scope, input) {
     const kind = input.kind === undefined ? undefined : normalizeKind(input.kind)
     const limit = input.limit ?? 20
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw new Error(`dsh-lancedb-memory: limit 必须是 1-100 的整数，收到 ${JSON.stringify(limit)}`)
     }
     const table = await this.#table()
-    if (table === undefined) return { memories: [], total: 0 }
+    if (table === undefined) return { scope, memories: [], total: 0 }
     await this.#prepare(table)
-    let query = table.query().select([
-      'id', 'text', 'kind', 'metadata', 'importance', 'createdAt', 'accessCount', 'lastAccessedAt',
-    ])
-    if (kind !== undefined) query = query.where(`kind = '${escapeSql(kind)}'`)
-    const rows = await query.orderBy({ columnName: 'createdAt', ascending: false }).limit(limit).toArray()
+    const predicate = this.#predicate([scope], kind)
+    const rows = await table.query()
+      .select(['id', 'text', 'kind', 'metadata', 'importance', 'createdAt', 'accessCount', 'lastAccessedAt'])
+      .where(predicate)
+      .orderBy({ columnName: 'createdAt', ascending: false })
+      .limit(limit)
+      .toArray()
     return {
+      scope,
       memories: rows.map(row => ({
         id: row.id,
         text: row.text,
@@ -585,29 +943,79 @@ class MemoryStore {
         lastAccessedAt: Number(row.lastAccessedAt),
         metadata: parseMetadata(row.metadata),
       })),
-      total: await table.countRows(),
+      total: await table.countRows(predicate),
     }
   }
 
   /**
-   * Table size, per-kind counts, index state, and the resolved location.
+   * Table size, scope breakdown, and the resolved location.
+   * @param {string | undefined} sessionScopeValue - Caller session, for counts and TTL.
    * @returns Stats payload.
    */
-  async stats() {
+  async stats(sessionScopeValue) {
     const table = await this.#table()
-    if (table === undefined) return { ...this.describe(), exists: false, rows: 0, kinds: [] }
+    if (table === undefined) {
+      return {
+        ...this.describe(), exists: false, rows: 0, kinds: [],
+        scopes: { session: 0, sessions: 0, souls: [] },
+      }
+    }
     await this.#prepare(table)
+    let purged = 0
+    if (this.#settings.sessionTtlDays > 0 && sessionScopeValue !== undefined) {
+      const cutoff = Date.now() - this.#settings.sessionTtlDays * DAY_MS
+      try {
+        const stale = `scope LIKE '${SESSION_PREFIX}%' AND lastAccessedAt < ${cutoff} AND scope != '${escapeSql(sessionScopeValue)}'`
+        const before = await table.countRows(stale)
+        if (before > 0) await table.delete(stale)
+        purged = before
+      } catch {
+        purged = -1
+      }
+    }
+
     const rows = await table.countRows()
-    const counts = new Map()
-    const kinds = await table.query().select(['kind']).toArray()
-    for (const row of kinds) counts.set(row.kind, (counts.get(row.kind) ?? 0) + 1)
+    const kinds = new Map()
+    const scopes = new Map()
+    const all = await table.query().select(['scope', 'kind']).toArray()
+    for (const row of all) {
+      kinds.set(row.kind, (kinds.get(row.kind) ?? 0) + 1)
+      scopes.set(row.scope, (scopes.get(row.scope) ?? 0) + 1)
+    }
+    const souls = Object.entries(await this.#souls())
+      .map(([entryName, entry]) => ({
+        name: entryName,
+        description: entry.description,
+        notes: scopes.get(soulScope(entryName)) ?? 0,
+      }))
+      .sort((left, right) => right.notes - left.notes)
+    const sessionScopes = [...scopes.keys()].filter(scope => scope.startsWith(SESSION_PREFIX))
     return {
       ...this.describe(),
       exists: true,
       rows,
-      kinds: [...counts].map(([kind, count]) => ({ kind, count })).sort((left, right) => right.count - left.count),
+      kinds: [...kinds].map(([kind, count]) => ({ kind, count })).sort((left, right) => right.count - left.count),
+      scopes: {
+        session: sessionScopeValue === undefined ? 0 : scopes.get(sessionScopeValue) ?? 0,
+        sessions: sessionScopes.length,
+        souls,
+      },
+      ...purged === 0 ? {} : { purgedSessions: purged },
       search: this.#settings.search,
     }
+  }
+
+  /**
+   * Build the SQL predicate for a set of scopes and an optional kind.
+   * @param {string[]} scopes - Scopes to include.
+   * @param {string | undefined} kind - Optional kind filter.
+   * @returns SQL predicate.
+   */
+  #predicate(scopes, kind) {
+    const list = scopes.map(scope => `'${escapeSql(scope)}'`).join(', ')
+    return kind === undefined
+      ? `scope IN (${list})`
+      : `scope IN (${list}) AND kind = '${escapeSql(kind)}'`
   }
 
   /** Drop the cached connection so unload does not keep the native handle. */
@@ -622,10 +1030,7 @@ class MemoryStore {
  * Fuse vector and BM25 results, then apply the lifecycle multiplier.
  *
  * Vector similarity is already 0-1 for normalized embeddings; BM25 is unbounded,
- * so it is divided by the strongest BM25 hit in this candidate pool. The two are
- * then combined with the configured weights. A row one modality missed scores 0
- * for that modality rather than dropping out, which is why a keyword-only hit
- * can still surface on a semantic query.
+ * so it is divided by the strongest BM25 hit in this candidate pool.
  *
  * @param {any[]} vectorRows - Cosine results with `_distance`.
  * @param {any[]} ftsRows - BM25 results with `_score`.
@@ -634,7 +1039,6 @@ class MemoryStore {
  * @returns Scored candidates.
  */
 function fuse(vectorRows, ftsRows, settings, now) {
-  // A row found by both modalities is stored once, so scores live in side maps.
   const vectorRank = new Map(vectorRows.map((row, index) => [row.id, index]))
   const ftsRank = new Map(ftsRows.map((row, index) => [row.id, index]))
   const distance = new Map(vectorRows.map(row => [row.id, Number(row._distance)]))
@@ -686,6 +1090,7 @@ function toResult(item) {
     id: row.id,
     text: row.text,
     kind: row.kind,
+    scope: row.scope,
     score: round(item.score),
     ...item.similarity === undefined ? {} : { similarity: round(item.similarity) },
     match: item.match,
@@ -759,6 +1164,18 @@ function normalizeKind(value) {
 }
 
 /**
+ * Normalize a soul name.
+ * @param {unknown} value - Raw name.
+ * @returns Valid soul name.
+ */
+function normalizeSoulName(value) {
+  if (typeof value !== 'string' || !SOUL_PATTERN.test(value)) {
+    throw new Error(`dsh-lancedb-memory: soul 名只能用小写字母、数字、_ 和 -，最长 32，收到 ${JSON.stringify(value)}`)
+  }
+  return value
+}
+
+/**
  * Normalize the optional metadata object.
  * @param {unknown} value - Raw metadata.
  * @returns Plain JSON object.
@@ -801,6 +1218,62 @@ function parseMetadata(value) {
   } catch {
     return {}
   }
+}
+
+/**
+ * Stable id for a note inside one scope.
+ * @param {string} scope - Target scope.
+ * @param {string} kind - Kind label.
+ * @param {string} text - Note text.
+ * @returns 32 hex characters.
+ */
+function hashId(scope, kind, text) {
+  return createHash('sha256').update(`${scope}\u0000${kind}\u0000${text}`).digest('hex').slice(0, 32)
+}
+
+/**
+ * Build the SQL predicate for a set of scopes and an optional kind.
+ * @param {string[]} scopes - Scopes to include.
+ * @param {string | undefined} kind - Optional kind filter.
+ * @returns SQL predicate.
+ */
+function scopePredicate(scopes, kind) {
+  const list = scopes.map(scope => `'${escapeSql(scope)}'`).join(', ')
+  return kind === undefined
+    ? `scope IN (${list})`
+    : `scope IN (${list}) AND kind = '${escapeSql(kind)}'`
+}
+
+/** @param {string} nameValue - Soul name. */
+function soulScope(nameValue) {
+  return `${SOUL_PREFIX}${nameValue}`
+}
+
+/** @param {string} session - Session id. */
+function sessionScope(session) {
+  return `${SESSION_PREFIX}${session}`
+}
+
+/**
+ * Extract a soul name from a scope string.
+ * @param {unknown} scope - Scope value.
+ * @returns Soul name when the scope is a soul.
+ */
+function soulNameOf(scope) {
+  return typeof scope === 'string' && scope.startsWith(SOUL_PREFIX)
+    ? scope.slice(SOUL_PREFIX.length)
+    : undefined
+}
+
+/**
+ * Extract a session id from a scope string.
+ * @param {unknown} scope - Scope value.
+ * @returns Session id when the scope is a session.
+ */
+function sessionIdOf(scope) {
+  return typeof scope === 'string' && scope.startsWith(SESSION_PREFIX)
+    ? scope.slice(SESSION_PREFIX.length)
+    : undefined
 }
 
 /**
@@ -868,8 +1341,20 @@ function tool(spec) {
 }
 
 /**
- * Register the service and tools. Storage is opened lazily on the first call so
- * activation stays cheap and never blocks on the native module.
+ * Resolve the calling session's scope from a tool execution.
+ * @param {{ agent?: { id?: unknown } }} exec - Tool run context.
+ * @returns Session scope.
+ */
+function scopeOfExecution(exec) {
+  const id = exec?.agent?.id
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new Error('dsh-lancedb-memory: 这个工具只能在会话里调用')
+  }
+  return sessionScope(id)
+}
+
+/**
+ * Register the service and tools.
  * @param {import('@deepseek-ai/cordis').Context} ctx - Plugin context.
  * @param {unknown} config - Row config.
  */
@@ -879,19 +1364,24 @@ export function apply(ctx, config) {
 
   ctx.effect(() => ctx.provide('lancedb', {
     describe: () => store.describe(),
-    store: input => store.store(input),
-    search: input => store.search(input),
-    forget: id => store.forget(id),
-    list: input => store.list(input),
-    stats: () => store.stats(),
+    store: (scope, input) => store.store(scope, input),
+    search: (scopes, input) => store.search(scopes, input),
+    list: (scope, input) => store.list(scope, input),
+    promote: (sessionScopeValue, input) => store.promote(sessionScopeValue, input),
+    forget: (sessionScopeValue, input) => store.forget(sessionScopeValue, input),
+    souls: sessionScopeValue => store.soulCatalog(sessionScopeValue),
+    createSoul: input => store.createSoul(input),
+    deleteSoul: input => store.deleteSoul(input),
+    attach: (sessionScopeValue, input) => store.attach(sessionScopeValue, input),
+    stats: sessionScopeValue => store.stats(sessionScopeValue),
   }))
   ctx.effect(() => () => store.close())
 
   const tools = [
     tool({
       name: 'lancedb_store',
-      description: '把一条笔记写入记忆库并返回 id。适合记住事实、决定、代码位置或用户偏好；'
-        + '同样的 kind 和文本重复写入不会产生重复行，语义上高度相近的笔记也会归到已有那条。',
+      description: '把一条笔记写进记忆库并返回 id。默认写当前会话；指定 soul 时直接写进那个 soul（soul 要先建）。'
+        + '同样的 scope、kind 和文本重复写入不会产生重复行。',
       parameters: {
         type: 'object',
         properties: {
@@ -909,60 +1399,129 @@ export function apply(ctx, config) {
             type: 'number',
             description: '重要度 1-10，默认 5；重要度高的笔记排序略靠前，衰减也更慢',
           },
+          soul: { type: 'string', description: '写入指定 soul；省略时写当前会话' },
         },
         required: ['text'],
         additionalProperties: false,
       },
-      execute: input => store.store(input),
+      execute: (input, exec) => store.store(
+        input.soul === undefined ? scopeOfExecution(exec) : soulScope(normalizeSoulName(input.soul)),
+        input,
+      ),
     }),
     tool({
       name: 'lancedb_search',
-      description: '按相似度检索记忆库：向量检索和 BM25 全文检索融合排序，返回最相关的笔记。'
-        + 'score 越大越相关，match 说明命中方式。',
+      description: '按相似度检索记忆：向量 + BM25 融合排序。默认范围是当前会话加上已挂载的 soul；'
+        + '传 souls 可临时改查哪些 soul。',
       parameters: {
         type: 'object',
         properties: {
           query: { type: 'string', description: '要检索的内容' },
           limit: { type: 'number', description: '返回条数，1-50，省略时用默认值' },
           kind: { type: 'string', description: '只在这类笔记里检索' },
-          minScore: { type: 'number', description: '最低分 0-1，省略时用插件配置；过滤掉明显不相关的结果' },
+          minScore: { type: 'number', description: '最低分 0-1，省略时用插件配置' },
+          souls: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '改查这些 soul（仍包含当前会话），省略时用已挂载的 soul',
+          },
         },
         required: ['query'],
         additionalProperties: false,
       },
-      execute: input => store.search(input),
+      execute: async (input, exec) => {
+        const session = scopeOfExecution(exec)
+        const explicit = input.souls === undefined
+          ? await store.attachedSouls(session)
+          : input.souls.map(normalizeSoulName)
+        return store.search([session, ...explicit.map(soulScope)], input)
+      },
+    }),
+    tool({
+      name: 'lancedb_promote',
+      description: '把当前会话里指定的记忆复制进某个 soul。默认 copy，move: true 时从会话删掉。',
+      parameters: {
+        type: 'object',
+        properties: {
+          ids: { type: 'array', items: { type: 'string' }, description: 'lancedb_store 返回的 id' },
+          soul: { type: 'string', description: '目标 soul，必须先创建' },
+          move: { type: 'boolean', description: 'true 表示复制后从当前会话删除，默认只复制' },
+        },
+        required: ['ids', 'soul'],
+        additionalProperties: false,
+      },
+      execute: (input, exec) => store.promote(scopeOfExecution(exec), input),
+    }),
+    tool({
+      name: 'lancedb_souls',
+      description: '管理 soul：list 看有哪些 soul 和描述，create 新建，delete 连内容一起删（要 force: true）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'create', 'delete'], description: '要做的操作' },
+          name: { type: 'string', description: 'soul 名，小写字母/数字/_/-，最长 32' },
+          description: { type: 'string', description: 'create 时必填：这个 soul 适合记什么，用来判断何时挂载它' },
+          force: { type: 'boolean', description: 'delete 时必须传 true' },
+        },
+        required: ['action'],
+        additionalProperties: false,
+      },
+      execute: async (input, exec) => {
+        if (input.action === 'list') return store.soulCatalog(scopeOfExecution(exec))
+        if (input.action === 'create') return store.createSoul(input)
+        return store.deleteSoul(input)
+      },
+    }),
+    tool({
+      name: 'lancedb_attach',
+      description: '把 soul 挂到当前会话（之后 search 默认包含它），或 detach 卸掉。',
+      parameters: {
+        type: 'object',
+        properties: {
+          souls: { type: 'array', items: { type: 'string' }, description: '要挂载或卸下的 soul 名' },
+          detach: { type: 'boolean', description: 'true 表示卸下，默认挂载' },
+        },
+        required: ['souls'],
+        additionalProperties: false,
+      },
+      execute: (input, exec) => store.attach(scopeOfExecution(exec), input),
     }),
     tool({
       name: 'lancedb_list',
-      description: '按写入时间倒序列出记忆，可按 kind 过滤，用来查看记忆库里到底有什么。',
+      description: '按写入时间倒序列出记忆。默认列当前会话；传 soul 时列那个 soul。',
       parameters: {
         type: 'object',
         properties: {
           limit: { type: 'number', description: '返回条数，1-100，默认 20' },
           kind: { type: 'string', description: '只看这类笔记' },
+          soul: { type: 'string', description: '看某个 soul 而不是当前会话' },
         },
         additionalProperties: false,
       },
-      execute: input => store.list(input),
+      execute: (input, exec) => store.list(
+        input.soul === undefined ? scopeOfExecution(exec) : soulScope(normalizeSoulName(input.soul)),
+        input,
+      ),
     }),
     tool({
       name: 'lancedb_forget',
-      description: '按 id 删除一条记忆。只删除你确认已过时或错误的内容。',
+      description: '按 id 删除一条记忆。默认只能删当前会话的；删 soul 里的要显式传 soul。',
       parameters: {
         type: 'object',
         properties: {
           id: { type: 'string', description: 'lancedb_store 返回的 id' },
+          soul: { type: 'string', description: '从哪个 soul 删' },
         },
         required: ['id'],
         additionalProperties: false,
       },
-      execute: input => store.forget(input.id),
+      execute: (input, exec) => store.forget(scopeOfExecution(exec), input),
     }),
     tool({
       name: 'lancedb_stats',
-      description: '查看记忆库状态：存储目录、表名、行数、各 kind 数量、向量维度、检索模式（hybrid/vector）。',
+      description: '查看记忆库状态：目录、行数、kind 分布、当前会话与各 soul 的数量、检索模式。',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
-      execute: () => store.stats(),
+      execute: (_input, exec) => store.stats(scopeOfExecution(exec)),
     }),
   ]
 

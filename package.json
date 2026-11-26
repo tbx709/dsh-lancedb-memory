@@ -1,9 +1,9 @@
 {
   "name": "dsh-lancedb-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Embedded LanceDB memory with hybrid vector+BM25 retrieval, lifecycle ranking, and agent tools",
+  "description": "Embedded LanceDB memory for DSH: session-isolated storage, reusable souls, hybrid vector+BM25 recall",
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",

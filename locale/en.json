@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "LanceDB memory",
-    "description": "Local vector memory: agents store, search, and forget notes in an embedded LanceDB table."
+    "description": "Local vector memory: sessions stay isolated, notes can be promoted into a reusable soul, then searched or forgotten."
   }
 }

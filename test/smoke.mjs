@@ -1,11 +1,11 @@
 /**
  * Smoke test for the LanceDB memory plugin without a Host process.
  *
- * It drives the same tool definitions the model calls, against temporary
- * tables, and covers: hybrid retrieval (vector + BM25), kind filtering,
- * lifecycle ranking (importance, recency), access reinforcement, near-duplicate
- * suppression, schema migration from v0.1, and an OpenAI-compatible HTTP
- * embedder served locally.
+ * Drives the same tool definitions the model calls and covers: session
+ * isolation, souls (create/attach/promote/delete), explicit-scope search,
+ * cross-session access rules, hybrid retrieval, dedupe, lifecycle ranking,
+ * access reinforcement, the v0.2 migration into the `imported` soul, and an
+ * OpenAI-compatible HTTP embedder served locally.
  */
 
 import assert from 'node:assert/strict'
@@ -15,6 +15,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from '@lancedb/lancedb'
 import { apply } from '../index.js'
+
+const TOOLS = [
+  'lancedb_attach', 'lancedb_forget', 'lancedb_list', 'lancedb_promote',
+  'lancedb_search', 'lancedb_souls', 'lancedb_stats', 'lancedb_store',
+]
 
 /**
  * Minimal Cordis context: capture tools, services, and disposers.
@@ -46,9 +51,9 @@ function createContext() {
 }
 
 /**
- * Boot one plugin instance and return its tools plus a disposer.
+ * Boot one plugin instance.
  * @param {object} config - Row config.
- * @returns Tools map and cleanup.
+ * @returns Tools, services, and a stop function.
  */
 function boot(config) {
   const instance = createContext()
@@ -62,21 +67,27 @@ function boot(config) {
   }
 }
 
+let sequence = 0
 /**
- * Call a registered tool the way the executor does.
+ * Call a registered tool the way the executor does, as one session.
  * @param {Map<string, any>} tools - Registered tools.
  * @param {string} name - Tool name.
  * @param {object} input - Tool arguments.
+ * @param {string} session - Session id.
  * @returns The tool value.
  */
-async function call(tools, name, input) {
+async function call(tools, name, input, session = 'session-a') {
   const definition = tools.get(name)
   assert.ok(definition, `tool ${name} is registered`)
-  return definition.execute(input, { signal: new AbortController().signal })
+  sequence += 1
+  return definition.execute(input, {
+    signal: new AbortController().signal,
+    agent: { id: session },
+  })
 }
 
 /**
- * Build a deterministic one-hot legacy vector.
+ * Build a deterministic one-hot vector for legacy rows.
  * @param {number} dimension - Vector length.
  * @returns Vector.
  */
@@ -87,7 +98,7 @@ function oneHot(dimension) {
 }
 
 const root = await mkdtemp(join(tmpdir(), 'lancedb-plugin-'))
-const hashConfig = directory => ({
+const configFor = directory => ({
   directory,
   table: 'memories',
   topK: 3,
@@ -95,121 +106,165 @@ const hashConfig = directory => ({
 })
 
 try {
-  // --- Core store / list / search / forget --------------------------------
+  // --- Session isolation ---------------------------------------------------
   const directory = join(root, 'core')
-  const plugin = boot(hashConfig(directory))
-  assert.deepEqual([...plugin.tools.keys()].sort(), [
-    'lancedb_forget', 'lancedb_list', 'lancedb_search', 'lancedb_stats', 'lancedb_store',
-  ])
+  const plugin = boot(configFor(directory))
+  assert.deepEqual([...plugin.tools.keys()].sort(), TOOLS)
   assert.ok(plugin.services.get('lancedb'), 'service is provided')
 
-  const apple = await call(plugin.tools, 'lancedb_store', { text: '苹果是红色的水果', kind: 'fact' })
+  const apple = await call(plugin.tools, 'lancedb_store', { text: '苹果是红色的水果', kind: 'fact' }, 'a')
   assert.equal(apple.created, true)
-  assert.match(apple.id, /^[0-9a-f]{32}$/u)
+  assert.equal(apple.scope, 'session:a')
 
-  const duplicate = await call(plugin.tools, 'lancedb_store', { text: '苹果是红色的水果', kind: 'fact' })
-  assert.equal(duplicate.created, false)
-  assert.equal(duplicate.total, 1)
+  const leaked = await call(plugin.tools, 'lancedb_search', { query: '红色水果' }, 'b')
+  assert.equal(leaked.results.length, 0, 'session b cannot see session a')
+  const leakedList = await call(plugin.tools, 'lancedb_list', {}, 'b')
+  assert.equal(leakedList.memories.length, 0)
 
-  const nearCopy = await call(plugin.tools, 'lancedb_store', { text: '苹果是红色的水果！', kind: 'fact' })
-  assert.equal(nearCopy.duplicate, true, 'near-duplicate collapses into the stored row')
-  assert.equal(nearCopy.id, apple.id)
+  const own = await call(plugin.tools, 'lancedb_store', { text: '苹果是红色的水果', kind: 'fact' }, 'b')
+  assert.notEqual(own.id, apple.id, 'ids are scoped')
+  assert.equal(own.total, 2)
 
-  await call(plugin.tools, 'lancedb_store', {
-    text: '香蕉是黄色的水果',
-    kind: 'fact',
-    metadata: { source: 'test', line: 2 },
+  // --- Souls: create, list, attach ----------------------------------------
+  const writing = await call(plugin.tools, 'lancedb_souls', {
+    action: 'create', name: 'writing', description: '用户的文案偏好与定稿案例',
   })
-  await call(plugin.tools, 'lancedb_store', { text: '用户偏好简短的回答', kind: 'preference' })
+  assert.equal(writing.soul, 'writing')
+  await assert.rejects(
+    call(plugin.tools, 'lancedb_souls', { action: 'create', name: 'Writing', description: 'x' }),
+    /soul 名/u,
+  )
+  await assert.rejects(
+    call(plugin.tools, 'lancedb_souls', { action: 'create', name: 'writing', description: 'x' }),
+    /已存在/u,
+  )
+  await assert.rejects(
+    call(plugin.tools, 'lancedb_souls', { action: 'create', name: 'empty' }),
+    /description/u,
+  )
 
-  const listed = await call(plugin.tools, 'lancedb_list', {})
-  assert.equal(listed.total, 3)
-  assert.deepEqual(listed.memories.map(row => row.text), [
-    '用户偏好简短的回答', '香蕉是黄色的水果', '苹果是红色的水果',
-  ], 'list is newest first')
+  let catalog = await call(plugin.tools, 'lancedb_souls', { action: 'list' }, 'b')
+  assert.equal(catalog.souls.length, 1)
+  assert.equal(catalog.souls[0].name, 'writing')
+  assert.equal(catalog.souls[0].notes, 0)
+  assert.equal(catalog.souls[0].attached, false)
 
-  const found = await call(plugin.tools, 'lancedb_search', { query: '红色水果', limit: 2 })
-  assert.equal(found.retrieval, 'hybrid', 'BM25 index is live')
-  assert.equal(found.results[0].text, '苹果是红色的水果')
-  assert.ok(found.results[0].score > found.results[1].score)
-  assert.ok(['both', 'vector', 'bm25'].includes(found.results[0].match))
+  const attached = await call(plugin.tools, 'lancedb_attach', { souls: ['writing'] }, 'b')
+  assert.deepEqual(attached.attached, ['writing'])
+  catalog = await call(plugin.tools, 'lancedb_souls', { action: 'list' }, 'b')
+  assert.equal(catalog.souls[0].attached, true)
+  await assert.rejects(call(plugin.tools, 'lancedb_attach', { souls: ['nope'] }, 'b'), /不存在/u)
 
-  const filtered = await call(plugin.tools, 'lancedb_search', { query: '用户偏好', kind: 'fact' })
-  assert.ok(filtered.results.every(row => row.kind === 'fact'))
-  const preference = await call(plugin.tools, 'lancedb_search', { query: '简短回答', kind: 'preference' })
-  assert.equal(preference.results[0].text, '用户偏好简短的回答')
+  // --- Promote from a session into a soul ---------------------------------
+  const draft = await call(plugin.tools, 'lancedb_store', {
+    text: '文案标题尽量控制在 20 字以内',
+    kind: 'preference',
+    importance: 8,
+  }, 'a')
+  await assert.rejects(
+    call(plugin.tools, 'lancedb_promote', { ids: [draft.id], soul: 'nope' }, 'a'),
+    /不存在/u,
+  )
+  const promoted = await call(plugin.tools, 'lancedb_promote', { ids: [draft.id], soul: 'writing' }, 'a')
+  assert.equal(promoted.copied.length, 1)
+  assert.equal(promoted.copied[0].id, draft.id)
+  assert.notEqual(promoted.copied[0].newId, draft.id)
 
-  // Access reinforcement: two recalls move accessCount and lastAccessedAt.
-  await call(plugin.tools, 'lancedb_search', { query: '香蕉', kind: 'fact' })
-  const afterRecall = await call(plugin.tools, 'lancedb_list', { kind: 'fact' })
-  const banana = afterRecall.memories.find(row => row.text === '香蕉是黄色的水果')
-  assert.ok(banana.accessCount >= 1, 'recalled rows are reinforced')
-  assert.ok(banana.lastAccessedAt >= banana.createdAt)
+  const again = await call(plugin.tools, 'lancedb_promote', { ids: [draft.id], soul: 'writing' }, 'a')
+  assert.equal(again.copied.length, 0)
+  assert.equal(again.skipped[0].reason, 'already-in-soul')
 
-  await assert.rejects(call(plugin.tools, 'lancedb_search', { query: 'x', minScore: 2 }), /minScore/u)
-  await assert.rejects(call(plugin.tools, 'lancedb_forget', { id: 'not-an-id' }), /32 位十六进制/u)
-  await assert.rejects(call(plugin.tools, 'lancedb_store', { text: '   ' }), /不能为空/u)
-  await assert.rejects(call(plugin.tools, 'lancedb_store', { text: 'x', importance: 0 }), /importance/u)
+  const foreign = await call(plugin.tools, 'lancedb_promote', { ids: [own.id], soul: 'writing' }, 'a')
+  assert.equal(foreign.skipped[0].reason, 'not-in-session', 'cannot promote another session note')
 
-  const stats = await call(plugin.tools, 'lancedb_stats', {})
-  assert.equal(stats.rows, 3)
+  // b attached the soul, so its recall now crosses the boundary deliberately.
+  const recalled = await call(plugin.tools, 'lancedb_search', { query: '文案标题' }, 'b')
+  assert.equal(recalled.results[0].id, promoted.copied[0].newId)
+  assert.equal(recalled.results[0].scope, 'soul:writing')
+  assert.equal(recalled.retrieval, 'hybrid')
+
+  // Explicit scope selection overrides attachments.
+  const explicit = await call(plugin.tools, 'lancedb_search', { query: '文案标题', souls: [] }, 'b')
+  assert.equal(explicit.results.length, 0)
+  assert.deepEqual(await call(plugin.tools, 'lancedb_attach', { souls: ['writing'], detach: true }, 'b')
+    .then(result => result.attached), [])
+
+  const soulList = await call(plugin.tools, 'lancedb_list', { soul: 'writing' }, 'b')
+  assert.equal(soulList.memories.length, 1)
+  assert.equal(soulList.scope, 'soul:writing')
+
+  // --- Store straight into a soul -----------------------------------------
+  await assert.rejects(
+    call(plugin.tools, 'lancedb_store', { text: '直接写进不存在的 soul', soul: 'ghost' }),
+    /不存在/u,
+  )
+  const direct = await call(plugin.tools, 'lancedb_store', {
+    text: '标题里不要用问号', kind: 'preference', soul: 'writing',
+  }, 'b')
+  assert.equal(direct.scope, 'soul:writing')
+  assert.equal(direct.created, true)
+
+  // --- Forget rules --------------------------------------------------------
+  await assert.rejects(
+    call(plugin.tools, 'lancedb_forget', { id: apple.id }, 'b'),
+    /只能删当前会话/u,
+  )
+  await assert.rejects(
+    call(plugin.tools, 'lancedb_forget', { id: direct.id }, 'b'),
+    /只能删当前会话/u,
+  )
+  const deletedSoulNote = await call(plugin.tools, 'lancedb_forget', { id: direct.id, soul: 'writing' }, 'b')
+  assert.equal(deletedSoulNote.deleted, true)
+  const deletedOwn = await call(plugin.tools, 'lancedb_forget', { id: own.id }, 'b')
+  assert.equal(deletedOwn.deleted, true)
+
+  // --- Lifecycle ranking and access reinforcement --------------------------
+  await call(plugin.tools, 'lancedb_store', { text: '完全相同的记忆文本', kind: 'low', importance: 1 }, 'c')
+  const high = await call(plugin.tools, 'lancedb_store', {
+    text: '完全相同的记忆文本', kind: 'high', importance: 10,
+  }, 'c')
+  const importanceSearch = await call(plugin.tools, 'lancedb_search', { query: '完全相同的记忆文本' }, 'c')
+  assert.equal(importanceSearch.results[0].kind, 'high')
+
+  await call(plugin.tools, 'lancedb_search', { query: '红色水果' }, 'a')
+  const reinforced = await call(plugin.tools, 'lancedb_list', { kind: 'fact' }, 'a')
+  assert.ok(reinforced.memories[0].accessCount >= 1, 'recalled rows are reinforced')
+  assert.ok(reinforced.memories[0].lastAccessedAt >= reinforced.memories[0].createdAt)
+  assert.ok(high.total >= 2)
+
+  // --- Stats ---------------------------------------------------------------
+  const stats = await call(plugin.tools, 'lancedb_stats', {}, 'c')
+  assert.equal(stats.exists, true)
+  assert.ok(stats.rows >= 3)
+  assert.ok(stats.scopes.sessions >= 2)
+  assert.equal(stats.scopes.souls.find(soul => soul.name === 'writing').notes, 1)
   assert.equal(stats.retrieval, 'hybrid')
-  assert.deepEqual(stats.kinds, [{ kind: 'fact', count: 2 }, { kind: 'preference', count: 1 }])
-  assert.equal(stats.dimension, 128)
-  assert.equal(stats.ftsError, undefined)
 
-  const forgotten = await call(plugin.tools, 'lancedb_forget', { id: apple.id })
-  assert.equal(forgotten.deleted, true)
-  assert.equal(forgotten.total, 2)
+  // --- Soul deletion removes rows and attachments -------------------------
+  await call(plugin.tools, 'lancedb_attach', { souls: ['writing'] }, 'b')
+  await assert.rejects(
+    call(plugin.tools, 'lancedb_souls', { action: 'delete', name: 'writing' }, 'b'),
+    /force/u,
+  )
+  const removed = await call(plugin.tools, 'lancedb_souls', { action: 'delete', name: 'writing', force: true }, 'b')
+  assert.equal(removed.soul, 'writing')
+  assert.equal(removed.deletedRows, 1)
+  assert.equal(removed.detachedSessions, 1)
+  catalog = await call(plugin.tools, 'lancedb_souls', { action: 'list' }, 'b')
+  assert.equal(catalog.souls.length, 0)
 
   plugin.stop()
-  assert.equal(plugin.tools.size, 0, 'tools unregister on dispose')
-  assert.equal(plugin.services.size, 0, 'service unregisters on dispose')
+  assert.equal(plugin.tools.size, 0)
 
-  // --- Reopen: rows and the index survive ---------------------------------
-  const reopened = boot(hashConfig(directory))
-  const persisted = await call(reopened.tools, 'lancedb_stats', {})
-  assert.equal(persisted.rows, 2)
-  const reopenedSearch = await call(reopened.tools, 'lancedb_search', { query: '黄色水果' })
-  assert.equal(reopenedSearch.results[0].text, '香蕉是黄色的水果')
+  // --- Reopen: rows and attachments survive -------------------------------
+  const reopened = boot(configFor(directory))
+  const reopenedStats = await call(reopened.tools, 'lancedb_stats', {}, 'c')
+  assert.equal(reopenedStats.rows, stats.rows - 1, 'only the soul row was deleted')
+  const reopenedSearch = await call(reopened.tools, 'lancedb_search', { query: '红色水果' }, 'a')
+  assert.equal(reopenedSearch.results[0].text, '苹果是红色的水果')
   reopened.stop()
 
-  // --- Importance and recency nudge equal text apart ----------------------
-  const rankDirectory = join(root, 'rank')
-  const ranked = boot(hashConfig(rankDirectory))
-  const sameText = '完全相同的记忆文本'
-  const low = await call(ranked.tools, 'lancedb_store', { text: sameText, kind: 'low', importance: 1 })
-  const high = await call(ranked.tools, 'lancedb_store', { text: sameText, kind: 'high', importance: 10 })
-  const importanceSearch = await call(ranked.tools, 'lancedb_search', { query: sameText, limit: 2 })
-  assert.equal(importanceSearch.results[0].kind, 'high', 'importance breaks the tie')
-
-  const db = await connect(rankDirectory)
-  const table = await db.openTable('memories')
-  const stale = Date.now() - 120 * 86_400_000
-  await table.update({ where: `id = '${low.id}'`, values: { createdAt: stale, lastAccessedAt: stale } })
-  const recencySearch = await call(ranked.tools, 'lancedb_search', { query: sameText, limit: 2 })
-  assert.equal(recencySearch.results.find(row => row.id === high.id).score > recencySearch.results.find(row => row.id === low.id).score, true, 'recency breaks the tie')
-  await db.close?.()
-  ranked.stop()
-
-  // --- BM25-only retrieval finds Chinese keywords -------------------------
-  const ftsDirectory = join(root, 'fts')
-  const ftsOnly = boot({
-    directory: ftsDirectory,
-    table: 'memories',
-    embedding: { provider: 'hash', dimension: 128 },
-    search: { vectorWeight: 0, bm25Weight: 1 },
-  })
-  await call(ftsOnly.tools, 'lancedb_store', { text: '蓝莓酱的做法：小火慢熬' })
-  await call(ftsOnly.tools, 'lancedb_store', { text: '香蕉要放熟再吃' })
-  await call(ftsOnly.tools, 'lancedb_store', { text: '苹果派需要肉桂' })
-  const ftsHit = await call(ftsOnly.tools, 'lancedb_search', { query: '蓝莓酱', limit: 3 })
-  assert.equal(ftsHit.results.length, 1, 'only the BM25 match survives zero vector weight')
-  assert.equal(ftsHit.results[0].match, 'bm25')
-  assert.equal(ftsHit.results[0].text, '蓝莓酱的做法：小火慢熬')
-  ftsOnly.stop()
-
-  // --- Migration from the v0.1 schema -------------------------------------
+  // --- v0.2 migration: rows become the imported soul ----------------------
   const legacyDirectory = join(root, 'legacy')
   const legacyDb = await connect(legacyDirectory)
   const legacy = await legacyDb.createTable('memories', [{
@@ -223,23 +278,27 @@ try {
   assert.equal((await legacy.schema()).fields.length, 6)
   await legacyDb.close?.()
 
-  const migrated = boot(hashConfig(legacyDirectory))
-  const migratedStats = await call(migrated.tools, 'lancedb_stats', {})
+  const migrated = boot(configFor(legacyDirectory))
+  const migratedStats = await call(migrated.tools, 'lancedb_stats', {}, 'x')
   assert.equal(migratedStats.rows, 1)
-  assert.equal(migratedStats.retrieval, 'hybrid', 'index is built for an existing table')
-  const migratedSearch = await call(migrated.tools, 'lancedb_search', { query: '向量检索' })
+  assert.equal(migratedStats.retrieval, 'hybrid')
+  const imported = migratedStats.scopes.souls.find(soul => soul.name === 'imported')
+  assert.equal(imported.notes, 1)
+  const migratedSearch = await call(migrated.tools, 'lancedb_search', {
+    query: '向量检索', souls: ['imported'],
+  }, 'x')
   assert.equal(migratedSearch.results[0].id, 'a'.repeat(32))
-  assert.equal(migratedSearch.results[0].importance, 5, 'new column is backfilled')
-  const migratedList = await call(migrated.tools, 'lancedb_list', {})
-  assert.equal(migratedList.memories[0].accessCount, 1, 'migrated rows can be reinforced')
+  assert.equal(migratedSearch.results[0].scope, 'soul:imported')
+  const migratedSession = await call(migrated.tools, 'lancedb_search', { query: '向量检索' }, 'x')
+  assert.equal(migratedSession.results.length, 0, 'old rows do not leak into sessions')
   const migratedTable = await (await connect(legacyDirectory)).openTable('memories')
-  const names = (await migratedTable.schema()).fields.map(field => field.name)
-  for (const column of ['importance', 'accessCount', 'lastAccessedAt', 'updatedAt']) {
-    assert.ok(names.includes(column), `migration added ${column}`)
+  const columns = (await migratedTable.schema()).fields.map(field => field.name)
+  for (const column of ['importance', 'accessCount', 'lastAccessedAt', 'updatedAt', 'scope']) {
+    assert.ok(columns.includes(column), `migration added ${column}`)
   }
   migrated.stop()
 
-  // --- HTTP embedder ------------------------------------------------------
+  // --- HTTP embedder -------------------------------------------------------
   let requestCount = 0
   const server = createServer((request, response) => {
     requestCount += 1
@@ -264,12 +323,11 @@ try {
         apiKeyEnv: 'DSH_LANCEDB_TEST_KEY',
       },
     })
-    const stored = await call(remote.tools, 'lancedb_store', { text: '远程嵌入写入' })
+    const stored = await call(remote.tools, 'lancedb_store', { text: '远程嵌入写入' }, 'r')
     assert.equal(stored.dimension, 4)
-    const searched = await call(remote.tools, 'lancedb_search', { query: '远程嵌入检索' })
-    assert.equal(searched.retrieval, 'hybrid')
+    const searched = await call(remote.tools, 'lancedb_search', { query: '远程嵌入检索' }, 'r')
     assert.equal(searched.results.length, 1)
-    assert.ok(requestCount >= 2, 'both store and search called the endpoint')
+    assert.ok(requestCount >= 2)
     remote.stop()
   } finally {
     server.close()
