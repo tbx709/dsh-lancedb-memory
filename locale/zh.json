@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "LanceDB 记忆库",
+    "description": "本地向量记忆：智能体把笔记写进内嵌 LanceDB 表，并按相似度检索或删除。"
+  }
+}

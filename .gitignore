@@ -1,0 +1,4 @@
+node_modules/
+*.lance/
+*.log
+.DS_Store

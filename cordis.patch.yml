@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-lancedb-memory
+      name: 'dsh-lancedb-memory'
+      config: {}
