@@ -106,10 +106,10 @@ patch 行里的 `config` 全部可选：
 `merge` 默认走语义合并，分三步：
 
 1. 从来源 soul 收集笔记，丢掉 `kind` 和文本完全相同的重复项。
-2. 用向量把候选笔记聚成相似组（`merge.similarity`，默认 0.8 余弦），只把有邻居的组发给模型——不会把整个库塞进一次请求。
+2. 候选不超过 40 条时全部交给模型判断；超过 40 条先用向量聚成相似组（`merge.similarity`，默认 0.55 余弦），只把有邻居的组发给模型——不会把整个库塞进一次请求。
 3. 模型返回 `{groups:[{ids,text,kind,importance}]}`：合并后的正文写进目标 soul，来源 soul 一条不动；没被分组的笔记原样复制。
 
-约束：模型只输出 JSON，解析失败或没有模型可用时自动回退机械合并，并在返回值里带 `semantic:false` 和 `semanticError`。合并结果的 id 按新文本重新算，`createdAt` 重置为合并时间。
+约束：模型只输出 JSON，解析失败或没有模型可用时自动回退机械合并，并在返回值里带 `semantic:false` 和 `semanticError`（界面上会显示"模型不可用，按文本合并了 N 条"）。合并结果的 id 按新文本重新算，`createdAt` 重置为合并时间。
 
 ## 数据布局
 
@@ -140,7 +140,8 @@ pnpm install     # 拉 @lancedb/lancedb@0.41.x，原生包约 205 MB，不进仓
 ## 自测
 
 ```bash
-node test/smoke.mjs   # 会话隔离、soul 增删挂载、promote、权限、排序、迁移、HTTP 嵌入
+node test/smoke.mjs    # 会话隔离、soul 增删挂载、promote、语义合并、排序、迁移、HTTP 嵌入
+node test/edges.mjs    # 校验错误、复制/合并竞态、维度不匹配、TTL 清理、路由参数校验
 ```
 
 ## 设计来源

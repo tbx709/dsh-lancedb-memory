@@ -363,7 +363,7 @@ window.__ModuleLoader__.load({
     function SoulStripView(props) {
       const {
         souls, attached, status, error, expanded, query, pending, preview, deleting, lastDeleted, t,
-        managing, selected, targetName, actionStatus, confirmDelete,
+        managing, selected, targetName, actionStatus, confirmDelete, acting,
       } = props
       const actionable = SOUL_NAME.test(targetName ?? '')
       const attachedSouls = souls.filter(soul => attached.includes(soul.name))
@@ -533,19 +533,19 @@ window.__ModuleLoader__.load({
           panel.push(h('div', { key: 'manage', className: 'dsh-ldb-souls-manage' },
             h('div', { className: 'dsh-ldb-souls-manage-row' },
               h('button', {
-                type: 'button', className: 'dsh-ldb-souls-action', disabled: !one, onClick: props.onCopy,
+                type: 'button', className: 'dsh-ldb-souls-action', disabled: !one || acting, onClick: props.onCopy,
               }, t('copy')),
               h('button', {
-                type: 'button', className: 'dsh-ldb-souls-action', disabled: !one, onClick: props.onRename,
+                type: 'button', className: 'dsh-ldb-souls-action', disabled: !one || acting, onClick: props.onRename,
               }, t('rename')),
               h('button', {
                 type: 'button',
                 className: 'dsh-ldb-souls-action',
-                disabled: !many || !actionable,
+                disabled: !many || !actionable || acting,
                 onClick: props.onMerge,
               }, t('merge')),
               h('button', {
-                type: 'button', className: 'dsh-ldb-souls-action danger', disabled: !one, onClick: props.onAskDelete,
+                type: 'button', className: 'dsh-ldb-souls-action danger', disabled: !one || acting, onClick: props.onAskDelete,
               }, t('deleteSoul')),
               h('span', { key: 'count', className: 'dsh-ldb-souls-muted' }, fill(t('selected'), selected.length))),
             editor,
@@ -583,10 +583,13 @@ window.__ModuleLoader__.load({
       const [confirmDelete, setConfirmDelete] = React.useState(undefined)
       const [renaming, setRenaming] = React.useState(false)
       const [renameValue, setRenameValue] = React.useState('')
+      const [acting, setActing] = React.useState(false)
 
       const load = React.useCallback(() => {
         if (sessionId === undefined) return
-        setState(previous => ({ ...previous, status: 'loading', error: undefined }))
+        setState(previous => previous.status === 'ready'
+          ? { ...previous, error: undefined }
+          : { ...previous, status: 'loading', error: undefined })
         post(SOULS_ROUTE, { sessionId }).then(
           data => setState({ status: 'ready', souls: data.souls ?? [], attached: data.attached ?? [], error: undefined }),
           error => setState(previous => ({ ...previous, status: 'error', error: error.message })),
@@ -667,23 +670,30 @@ window.__ModuleLoader__.load({
       const selectSoul = name => {
         setConfirmDelete(undefined)
         setActionStatus(undefined)
+        setRenaming(false)
+        setRenameValue('')
         setSelected(previous => previous.includes(name)
           ? previous.filter(item => item !== name)
           : [...previous, name])
       }
 
-      const runAction = (request, describe) => {
-        setActionStatus(undefined)
+      const runAction = (request, describe, pending) => {
+        if (acting) return
+        setActing(true)
+        setActionStatus(pending)
         request.then(result => {
           setActionStatus(describe(result))
           setSelected([])
           load()
         }).catch(error => setActionStatus(error.message))
+          .finally(() => setActing(false))
       }
 
       const copySelected = () => {
         const from = selected[0]
         if (from === undefined) return
+        setRenaming(false)
+        setRenameValue('')
         const to = nextCopyName(from, state.souls.map(soul => soul.name))
         runAction(post(COPY_ROUTE, { from, to }), result => fill(translate('copied'), result.copied))
       }
@@ -709,25 +719,34 @@ window.__ModuleLoader__.load({
           setRenaming(false)
           setRenameValue('')
           if (preview.name === from) setPreview({ name: undefined, status: 'idle', notes: [], total: 0 })
+          if (lastDeleted?.soul === from) setLastDeleted(undefined)
           return fill(translate('renamed'), to)
         })
       }
 
       const mergeSelected = () => {
         if (selected.length < 2) return
+        setRenaming(false)
+        setRenameValue('')
         runAction(post(MERGE_ROUTE, { sources: [...selected], target: targetName }), result =>
-          translate('merged')
-            .replace('{n}', String(result.copied))
-            .replace('{n2}', String(result.mergedGroups ?? 0))
-            .replace('{n3}', String(result.skipped)))
+          result.semanticError === undefined
+            ? translate('merged')
+              .replace('{n}', String(result.copied))
+              .replace('{n2}', String(result.mergedGroups ?? 0))
+              .replace('{n3}', String(result.skipped))
+            : translate('mergedFallback').replace('{n}', String(result.copied)),
+        translate('merging'))
       }
 
       const deleteSelected = () => {
         const name = confirmDelete
         if (name === undefined) return
+        setRenaming(false)
+        setRenameValue('')
         runAction(post(DELETE_SOUL_ROUTE, { name }), result => {
           setConfirmDelete(undefined)
           if (preview.name === name) setPreview({ name: undefined, status: 'idle', notes: [], total: 0 })
+          if (lastDeleted?.soul === name) setLastDeleted(undefined)
           return fill(translate('soulDeleted'), result.deletedRows)
         })
       }
@@ -761,6 +780,7 @@ window.__ModuleLoader__.load({
         targetName,
         actionStatus,
         confirmDelete,
+        acting,
         onManage: toggleManage,
         onSelect: selectSoul,
         onTarget: value => { setTargetName(value); setActionStatus(undefined) },
@@ -801,6 +821,8 @@ window.__ModuleLoader__.load({
               noMatch: '没有匹配的 soul',
               more: '还有 {n} 个',
               notes: '{n} 条',
+              manage: '管理',
+              exitManage: '退出管理',
               view: 'view',
               hide: 'hide',
               notesLoading: '读取中…',
@@ -815,6 +837,8 @@ window.__ModuleLoader__.load({
               renamed: '已改名为 {n}',
               copied: '已复制 {n} 条',
               merged: '已合并 {n} 条，语义合并 {n2} 组，跳过 {n3} 条',
+              mergedFallback: '模型不可用，按文本合并了 {n} 条',
+              merging: '合并中…（模型在整理）',
               soulDeleted: '已删除，连带 {n} 条记忆',
               selected: '已选 {n}',
               confirm: '确认',
@@ -837,6 +861,8 @@ window.__ModuleLoader__.load({
               noMatch: 'No matching soul',
               more: '+{n} more',
               notes: '{n} notes',
+              manage: 'Manage',
+              exitManage: 'Done',
               view: 'view',
               hide: 'hide',
               notesLoading: 'Loading…',
@@ -851,6 +877,8 @@ window.__ModuleLoader__.load({
               renamed: 'Renamed to {n}',
               copied: 'Copied {n} notes',
               merged: 'Merged {n} notes, {n2} groups consolidated, {n3} skipped',
+              mergedFallback: 'Model unavailable; merged {n} notes by text',
+              merging: 'Merging… (the model is consolidating)',
               soulDeleted: 'Deleted with {n} notes',
               selected: '{n} selected',
               confirm: 'Confirm',

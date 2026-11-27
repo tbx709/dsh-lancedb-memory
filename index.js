@@ -538,6 +538,14 @@ class MemoryStore {
   }
 
   /**
+   * Reject unknown souls before a read or write touches them.
+   * @param {string[]} names - Soul names.
+   */
+  async requireSouls(names) {
+    for (const name of names) await this.#requireSoul(name)
+  }
+
+  /**
    * Reject unknown souls before they reach storage.
    * @param {string} name - Soul name.
    */
@@ -617,14 +625,15 @@ class MemoryStore {
     const from = normalizeSoulName(input.from)
     const to = normalizeSoulName(input.to)
     if (from === to) throw new Error('dsh-lancedb-memory: 不能把 soul 复制到它自己')
-    await this.#requireSoul(from)
-    if ((await this.#souls())[to] !== undefined) throw new Error(`dsh-lancedb-memory: soul "${to}" 已存在`)
     const description = typeof input.description === 'string' && input.description.trim().length > 0
       ? input.description.trim().slice(0, 200)
       : `复制自 ${from}`
     const target = soulScope(to)
 
     return this.#serial(async () => {
+      const current = await this.#souls()
+      if (current[from] === undefined) throw new Error(`dsh-lancedb-memory: soul "${from}" 不存在`)
+      if (current[to] !== undefined) throw new Error(`dsh-lancedb-memory: soul "${to}" 已存在`)
       const table = await this.#table()
       let copied = 0
       if (table !== undefined) {
@@ -663,13 +672,13 @@ class MemoryStore {
     const from = normalizeSoulName(input.from)
     const to = normalizeSoulName(input.to)
     if (from === to) throw new Error('dsh-lancedb-memory: 新名字和原来一样')
-    await this.#requireSoul(from)
-    const souls = await this.#souls()
-    if (souls[to] !== undefined) throw new Error(`dsh-lancedb-memory: soul "${to}" 已存在`)
-    const entry = souls[from]
     const target = soulScope(to)
 
     return this.#serial(async () => {
+      const souls = await this.#souls()
+      if (souls[from] === undefined) throw new Error(`dsh-lancedb-memory: soul "${from}" 不存在`)
+      if (souls[to] !== undefined) throw new Error(`dsh-lancedb-memory: soul "${to}" 已存在`)
+      const entry = souls[from]
       const table = await this.#table()
       let moved = 0
       if (table !== undefined) {
@@ -751,13 +760,21 @@ class MemoryStore {
       let copied = 0
       let skipped = gathered.skipped
       let mergedGroups = 0
-      if (gathered.table !== undefined) {
-        const table = gathered.table
+      const table = gathered.table === undefined ? undefined : await this.#table()
+      if (table !== undefined) {
         const now = Date.now()
         const consumed = new Set()
+        // A concurrent merge into the same target may have landed while the
+        // model was thinking; recompute presence before writing anything.
+        const latest = await table.query()
+          .where(`scope = '${escapeSql(targetScope)}'`)
+          .select(['id'])
+          .toArray()
+        for (const row of latest) gathered.present.add(row.id)
         for (const plan of plans ?? []) {
           const added = await this.#addMergedRow(table, targetScope, plan, gathered.present, now)
           if (!added) {
+            for (const id of plan.ids) consumed.add(id)
             skipped += plan.ids.length
             continue
           }
@@ -1035,6 +1052,11 @@ class MemoryStore {
       }
 
       await this.#prepare(table)
+      const stored = await storedDimension(table)
+      if (stored !== undefined && stored !== vector.length) {
+        throw new Error(`dsh-lancedb-memory: 向量维度不匹配（表里是 ${stored}，本次是 ${vector.length}）；`
+          + '换 embedding 配置后需要新建表或清空旧表')
+      }
       const found = await table.query().where(`id = '${id}'`).limit(1).toArray()
       if (found.length > 0) {
         return { id, scope, kind, created: false, total: await table.countRows(), dimension: vector.length }
@@ -1256,6 +1278,7 @@ class MemoryStore {
         return { id, deleted: false, total: await table.countRows() }
       }
       await table.delete(`id = '${id}'`)
+      await this.#touchSoul(soul)
       return { id, deleted: true, total: await table.countRows() }
     })
   }
@@ -2081,6 +2104,7 @@ export function apply(ctx, config) {
         const explicit = input.souls === undefined
           ? await store.attachedSouls(session)
           : input.souls.map(normalizeSoulName)
+        await store.requireSouls(explicit)
         return store.search([session, ...explicit.map(soulScope)], input)
       },
     }),
