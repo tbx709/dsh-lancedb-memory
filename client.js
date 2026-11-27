@@ -23,6 +23,10 @@ window.__ModuleLoader__.load({
     const NOTES_ROUTE = '/api/lancedb/notes'
     const DELETE_ROUTE = '/api/lancedb/delete'
     const RESTORE_ROUTE = '/api/lancedb/restore'
+    const COPY_ROUTE = '/api/lancedb/souls/copy'
+    const MERGE_ROUTE = '/api/lancedb/souls/merge'
+    const DELETE_SOUL_ROUTE = '/api/lancedb/souls/delete'
+    const SOUL_NAME = /^[a-z0-9][a-z0-9_-]{0,31}$/
     /** Attached chips beyond this collapse into a "+N" marker. */
     const MAX_ATTACHED_CHIPS = 8
     /** The filter box only appears once the list is worth filtering. */
@@ -52,6 +56,19 @@ window.__ModuleLoader__.load({
       deleteNote: '删除这条',
       deleted: '已删除',
       undo: '撤销',
+      manage: '管理',
+      exitManage: '退出管理',
+      target: '目标 soul 名',
+      copy: '复制',
+      merge: '合并',
+      deleteSoul: '删除',
+      selected: '已选 {n}',
+      confirm: '确认',
+      cancel: '取消',
+      confirmDelete: '确认删除',
+      copied: '已复制 {n} 条',
+      merged: '已合并 {n} 条，跳过 {n2} 条重复',
+      soulDeleted: '已删除，连带 {n} 条记忆',
     }
 
     const CSS = `
@@ -211,6 +228,31 @@ window.__ModuleLoader__.load({
   border: 1px dashed var(--dsw-alias-border-l1);
   border-radius: 6px;
 }
+.dsh-ldb-souls-manage {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+.dsh-ldb-souls-manage-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dsh-ldb-souls-manage-row .dsh-ldb-souls-filter { flex: 1; min-width: 120px; }
+.dsh-ldb-souls-action {
+  padding: 2px 8px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.dsh-ldb-souls-action:hover:not(:disabled) { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); }
+.dsh-ldb-souls-action:disabled { opacity: .45; cursor: not-allowed; }
+.dsh-ldb-souls-action.danger { color: var(--dsw-alias-state-error-primary); }
+.dsh-ldb-souls-action.danger:hover:not(:disabled) { border-color: var(--dsw-alias-state-error-primary); }
+.dsh-ldb-souls-check { flex: none; margin: 0; cursor: pointer; }
+.dsh-ldb-souls-manage-status { opacity: .8; }
 `
 
     /**
@@ -300,7 +342,11 @@ window.__ModuleLoader__.load({
      * @returns React element.
      */
     function SoulStripView(props) {
-      const { souls, attached, status, error, expanded, query, pending, preview, deleting, lastDeleted, t } = props
+      const {
+        souls, attached, status, error, expanded, query, pending, preview, deleting, lastDeleted, t,
+        managing, selected, targetName, actionStatus, confirmDelete,
+      } = props
+      const actionable = SOUL_NAME.test(targetName ?? '')
       const attachedSouls = souls.filter(soul => attached.includes(soul.name))
       const shown = attachedSouls.slice(0, MAX_ATTACHED_CHIPS)
       const hidden = attachedSouls.length - shown.length
@@ -376,6 +422,15 @@ window.__ModuleLoader__.load({
           const description = soul.description === undefined || soul.description.length === 0 ? '\u00a0' : soul.description
           return h('div', { key: soul.name, className: 'dsh-ldb-souls-item' },
             h('div', { className: 'dsh-ldb-souls-item-row' },
+              managing
+                ? h('input', {
+                  type: 'checkbox',
+                  className: 'dsh-ldb-souls-check',
+                  checked: selected.includes(soul.name),
+                  'aria-label': soul.name,
+                  onChange: () => props.onSelect(soul.name),
+                })
+                : null,
               h('button', {
                 type: 'button',
                 className: 'dsh-ldb-souls-item-main',
@@ -406,6 +461,58 @@ window.__ModuleLoader__.load({
           matches.length === 0
             ? h('span', { key: 'no-match', className: 'dsh-ldb-souls-muted' }, t('noMatch'))
             : items))
+
+        const manage = [h('button', {
+          key: 'toggle-manage',
+          type: 'button',
+          className: 'dsh-ldb-souls-action',
+          onClick: props.onManage,
+        }, managing ? t('exitManage') : t('manage'))]
+        if (managing) manage.push(h('span', { key: 'count', className: 'dsh-ldb-souls-muted' }, fill(t('selected'), selected.length)))
+        panel.push(h('div', { key: 'manage-toggle', className: 'dsh-ldb-souls-manage-row' }, manage))
+
+        if (managing) {
+          const confirm = confirmDelete === undefined
+            ? null
+            : h('div', { key: 'confirm', className: 'dsh-ldb-souls-manage-row' },
+              h('span', { className: 'dsh-ldb-souls-error' }, `${t('confirmDelete')} ${confirmDelete}`),
+              h('button', {
+                type: 'button', className: 'dsh-ldb-souls-action danger', onClick: props.onDeleteConfirmed,
+              }, t('confirm')),
+              h('button', { type: 'button', className: 'dsh-ldb-souls-link', onClick: props.onCancelDelete }, t('cancel')))
+          panel.push(h('div', { key: 'manage', className: 'dsh-ldb-souls-manage' },
+            h('div', { className: 'dsh-ldb-souls-manage-row' },
+              h('input', {
+                className: 'dsh-ldb-souls-filter',
+                type: 'text',
+                value: targetName,
+                placeholder: t('target'),
+                'aria-label': t('target'),
+                onChange: event => props.onTarget(event.target.value),
+              }),
+              h('button', {
+                type: 'button',
+                className: 'dsh-ldb-souls-action',
+                disabled: selected.length !== 1 || !actionable,
+                onClick: props.onCopy,
+              }, t('copy')),
+              h('button', {
+                type: 'button',
+                className: 'dsh-ldb-souls-action',
+                disabled: selected.length < 2 || !actionable,
+                onClick: props.onMerge,
+              }, t('merge')),
+              h('button', {
+                type: 'button',
+                className: 'dsh-ldb-souls-action danger',
+                disabled: selected.length !== 1,
+                onClick: props.onAskDelete,
+              }, t('deleteSoul'))),
+            confirm,
+            actionStatus === undefined
+              ? null
+              : h('div', { key: 'status', className: 'dsh-ldb-souls-manage-status' }, actionStatus)))
+        }
         children.push(h('div', { key: 'panel', className: 'dsh-ldb-souls-panel', role: 'region', 'aria-label': t('label') }, panel))
       }
 
@@ -427,6 +534,11 @@ window.__ModuleLoader__.load({
       const [preview, setPreview] = React.useState({ name: undefined, status: 'idle', notes: [], total: 0 })
       const [deleting, setDeleting] = React.useState(undefined)
       const [lastDeleted, setLastDeleted] = React.useState(undefined)
+      const [managing, setManaging] = React.useState(false)
+      const [selected, setSelected] = React.useState([])
+      const [targetName, setTargetName] = React.useState('')
+      const [actionStatus, setActionStatus] = React.useState(undefined)
+      const [confirmDelete, setConfirmDelete] = React.useState(undefined)
 
       const load = React.useCallback(() => {
         if (sessionId === undefined) return
@@ -498,6 +610,53 @@ window.__ModuleLoader__.load({
         }).catch(error => setState(previous => ({ ...previous, error: error.message })))
       }
 
+      const toggleManage = () => {
+        setManaging(value => !value)
+        setSelected([])
+        setTargetName('')
+        setActionStatus(undefined)
+        setConfirmDelete(undefined)
+      }
+
+      const selectSoul = name => {
+        setConfirmDelete(undefined)
+        setActionStatus(undefined)
+        setSelected(previous => previous.includes(name)
+          ? previous.filter(item => item !== name)
+          : [...previous, name])
+      }
+
+      const runAction = (request, describe) => {
+        setActionStatus(undefined)
+        request.then(result => {
+          setActionStatus(describe(result))
+          setSelected([])
+          load()
+        }).catch(error => setActionStatus(error.message))
+      }
+
+      const copySelected = () => {
+        const from = selected[0]
+        if (from === undefined) return
+        runAction(post(COPY_ROUTE, { from, to: targetName }), result => fill(translate('copied'), result.copied))
+      }
+
+      const mergeSelected = () => {
+        if (selected.length < 2) return
+        runAction(post(MERGE_ROUTE, { sources: [...selected], target: targetName }), result =>
+          translate('merged').replace('{n}', String(result.copied)).replace('{n2}', String(result.skipped)))
+      }
+
+      const deleteSelected = () => {
+        const name = confirmDelete
+        if (name === undefined) return
+        runAction(post(DELETE_SOUL_ROUTE, { name }), result => {
+          setConfirmDelete(undefined)
+          if (preview.name === name) setPreview({ name: undefined, status: 'idle', notes: [], total: 0 })
+          return fill(translate('soulDeleted'), result.deletedRows)
+        })
+      }
+
       if (sessionId === undefined) return null
 
       return h(SoulStripView, {
@@ -522,6 +681,19 @@ window.__ModuleLoader__.load({
         onNotes: showNotes,
         onDelete: deleteNote,
         onUndo: undoDelete,
+        managing,
+        selected,
+        targetName,
+        actionStatus,
+        confirmDelete,
+        onManage: toggleManage,
+        onSelect: selectSoul,
+        onTarget: value => { setTargetName(value); setActionStatus(undefined) },
+        onCopy: copySelected,
+        onMerge: mergeSelected,
+        onAskDelete: () => { setConfirmDelete(selected[0]); setActionStatus(undefined) },
+        onDeleteConfirmed: deleteSelected,
+        onCancelDelete: () => setConfirmDelete(undefined),
       })
     }
 

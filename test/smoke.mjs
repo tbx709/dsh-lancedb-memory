@@ -248,6 +248,42 @@ try {
   assert.equal(restoredNote.created, true)
   assert.equal((await (await routePost(notesRouteAgain, { soul: 'writing' })).json()).memories.length, 1)
 
+  // Soul-level copy, merge, and delete from the picker.
+  const copyRoute = plugin.routes.get('/api/lancedb/souls/copy')
+  const mergeRoute = plugin.routes.get('/api/lancedb/souls/merge')
+  const deleteSoulRoute = plugin.routes.get('/api/lancedb/souls/delete')
+  assert.ok(copyRoute, 'copy route is registered')
+  assert.ok(mergeRoute, 'merge route is registered')
+  assert.ok(deleteSoulRoute, 'delete-soul route is registered')
+
+  const copiedSoul = await (await routePost(copyRoute, { from: 'writing', to: 'writing-copy' })).json()
+  assert.equal(copiedSoul.copied, 1)
+  assert.equal((await (await routePost(notesRouteAgain, { soul: 'writing-copy' })).json()).memories.length, 1)
+  assert.equal((await (await routePost(notesRouteAgain, { soul: 'writing' })).json()).memories.length, 1, 'copy keeps the source')
+
+  const merged = await (await routePost(mergeRoute, { sources: ['writing', 'writing-copy'], target: 'writing-all' })).json()
+  assert.equal(merged.copied, 1)
+  assert.equal(merged.skipped, 1)
+  assert.equal((await (await routePost(notesRouteAgain, { soul: 'writing-all' })).json()).memories.length, 1)
+  assert.equal((await (await routePost(notesRouteAgain, { soul: 'writing-copy' })).json()).memories.length, 1, 'merge keeps sources')
+
+  const removedCopy = await (await routePost(deleteSoulRoute, { name: 'writing-copy' })).json()
+  assert.equal(removedCopy.deletedRows, 1)
+  const removedAll = await (await routePost(deleteSoulRoute, { name: 'writing-all' })).json()
+  assert.equal(removedAll.deletedRows, 1)
+  const catalogAfter = await (await routePost(soulsRoute, { sessionId: 'ui' })).json()
+  assert.deepEqual(catalogAfter.souls.map(soul => soul.name), ['writing'])
+
+  // The same operations through the agent tool.
+  const toolCopy = await call(plugin.tools, 'lancedb_souls', { action: 'copy', name: 'writing', target: 'tool-copy' }, 'a')
+  assert.equal(toolCopy.copied, 1)
+  const toolMerge = await call(plugin.tools, 'lancedb_souls', {
+    action: 'merge', sources: ['tool-copy'], target: 'tool-all',
+  }, 'a')
+  assert.equal(toolMerge.copied, 1)
+  await call(plugin.tools, 'lancedb_souls', { action: 'delete', name: 'tool-copy', force: true }, 'a')
+  await call(plugin.tools, 'lancedb_souls', { action: 'delete', name: 'tool-all', force: true }, 'a')
+
   const foreign = await call(plugin.tools, 'lancedb_promote', { ids: [own.id], soul: 'writing' }, 'a')
   assert.equal(foreign.skipped[0].reason, 'not-in-session', 'cannot promote another session note')
 

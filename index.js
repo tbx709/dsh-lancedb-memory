@@ -600,6 +600,121 @@ class MemoryStore {
   }
 
   /**
+   * Copy every note of one soul into a new soul, leaving the source intact.
+   * @param {{ from: unknown, to: unknown, description?: unknown }} input - Request.
+   * @returns Copy summary.
+   */
+  async copySoul(input) {
+    const from = normalizeSoulName(input.from)
+    const to = normalizeSoulName(input.to)
+    if (from === to) throw new Error('dsh-lancedb-memory: 不能把 soul 复制到它自己')
+    await this.#requireSoul(from)
+    if ((await this.#souls())[to] !== undefined) throw new Error(`dsh-lancedb-memory: soul "${to}" 已存在`)
+    const description = typeof input.description === 'string' && input.description.trim().length > 0
+      ? input.description.trim().slice(0, 200)
+      : `复制自 ${from}`
+    const target = soulScope(to)
+
+    return this.#serial(async () => {
+      const table = await this.#table()
+      let copied = 0
+      if (table !== undefined) {
+        await this.#prepare(table)
+        const rows = await table.query().where(`scope = '${escapeSql(soulScope(from))}'`).toArray()
+        const now = Date.now()
+        for (const row of rows) {
+          await table.add([{
+            id: hashId(target, row.kind, row.text),
+            text: row.text,
+            kind: row.kind,
+            metadata: row.metadata,
+            vector: Array.from(row.vector),
+            createdAt: Number(row.createdAt),
+            importance: Number(row.importance ?? 5),
+            accessCount: 0,
+            lastAccessedAt: now,
+            updatedAt: now,
+            scope: target,
+          }])
+          copied += 1
+        }
+      }
+      await this.#writeSoul(to, { description })
+      return { from, to, copied }
+    })
+  }
+
+  /**
+   * Merge several souls into one target, keeping every source as it was. Notes
+   * that already exist in the target (same kind and text) are skipped.
+   * @param {{ sources: unknown, target: unknown, description?: unknown }} input - Request.
+   * @returns Merge summary.
+   */
+  async mergeSouls(input) {
+    if (!Array.isArray(input.sources) || input.sources.length === 0) {
+      throw new Error('dsh-lancedb-memory: sources 至少给一个 soul')
+    }
+    const sources = [...new Set(input.sources.map(normalizeSoulName))]
+    const target = normalizeSoulName(input.target)
+    if (sources.includes(target)) throw new Error('dsh-lancedb-memory: 目标 soul 不能同时是来源')
+    for (const name of sources) await this.#requireSoul(name)
+    const existing = await this.#souls()
+    const description = typeof input.description === 'string' && input.description.trim().length > 0
+      ? input.description.trim().slice(0, 200)
+      : `合并自 ${sources.join('、')}`
+    if (existing[target] === undefined) {
+      await this.#writeSoul(target, { description })
+    }
+    const targetScope = soulScope(target)
+
+    return this.#serial(async () => {
+      const table = await this.#table()
+      const copied = []
+      const skipped = []
+      if (table !== undefined) {
+        await this.#prepare(table)
+        const byId = new Map()
+        for (const name of sources) {
+          const rows = await table.query().where(`scope = '${escapeSql(soulScope(name))}'`).toArray()
+          for (const row of rows) {
+            const id = hashId(targetScope, row.kind, row.text)
+            if (byId.has(id)) {
+              skipped.push({ from: name, text: row.text, reason: 'duplicate' })
+              continue
+            }
+            byId.set(id, { row, from: name })
+          }
+        }
+        const existingRows = await table.query().where(`scope = '${escapeSql(targetScope)}'`).select(['id']).toArray()
+        const present = new Set(existingRows.map(row => row.id))
+        const now = Date.now()
+        for (const [id, entry] of byId) {
+          if (present.has(id)) {
+            skipped.push({ from: entry.from, text: entry.row.text, reason: 'already-in-target' })
+            continue
+          }
+          await table.add([{
+            id,
+            text: entry.row.text,
+            kind: entry.row.kind,
+            metadata: entry.row.metadata,
+            vector: Array.from(entry.row.vector),
+            createdAt: Number(entry.row.createdAt),
+            importance: Number(entry.row.importance ?? 5),
+            accessCount: 0,
+            lastAccessedAt: now,
+            updatedAt: now,
+            scope: targetScope,
+          }])
+          copied.push({ from: entry.from, id })
+        }
+      }
+      if (copied.length > 0) await this.#touchSoul(target)
+      return { target, sources, copied: copied.length, skipped: skipped.length }
+    })
+  }
+
+  /**
    * List souls with row counts and the caller's attachments.
    * @param {string | undefined} sessionScopeValue - Caller scope, for the attached flag.
    * @returns Soul catalog.
@@ -1497,6 +1612,47 @@ export function apply(ctx, config) {
         }
       },
     }))
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/lancedb/souls/copy',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const body = await request.json().catch(() => ({}))
+          return Response.json(await store.copySoul({ from: body.from, to: body.to, description: body.description }))
+        } catch (error) {
+          return Response.json({ error: errorMessage(error) }, { status: 400 })
+        }
+      },
+    }))
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/lancedb/souls/merge',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const body = await request.json().catch(() => ({}))
+          return Response.json(await store.mergeSouls({
+            sources: body.sources, target: body.target, description: body.description,
+          }))
+        } catch (error) {
+          return Response.json({ error: errorMessage(error) }, { status: 400 })
+        }
+      },
+    }))
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/lancedb/souls/delete',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const body = await request.json().catch(() => ({}))
+          return Response.json(await store.deleteSoul({ name: body.name, force: true }))
+        } catch (error) {
+          return Response.json({ error: errorMessage(error) }, { status: 400 })
+        }
+      },
+    }))
   })
 
   const tools = [
@@ -1576,13 +1732,24 @@ export function apply(ctx, config) {
     }),
     tool({
       name: 'lancedb_souls',
-      description: '管理 soul：list 看有哪些 soul 和描述，create 新建，delete 连内容一起删（要 force: true）。',
+      description: '管理 soul：list 列表，create 新建，copy 复制成新 soul，merge 合并多个（来源保留），'
+        + 'delete 连内容一起删（要 force: true）。',
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['list', 'create', 'delete'], description: '要做的操作' },
-          name: { type: 'string', description: 'soul 名，小写字母/数字/_/-，最长 32' },
-          description: { type: 'string', description: 'create 时必填：这个 soul 适合记什么，用来判断何时挂载它' },
+          action: {
+            type: 'string',
+            enum: ['list', 'create', 'copy', 'merge', 'delete'],
+            description: '要做的操作',
+          },
+          name: { type: 'string', description: 'copy 的来源 / delete 的目标；小写字母、数字、_ 和 -，最长 32' },
+          target: { type: 'string', description: 'copy / merge 的目标 soul 名；merge 时不存在会自动新建' },
+          sources: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'merge 的来源 soul 列表，合并后来源 soul 保留',
+          },
+          description: { type: 'string', description: 'create 时必填；copy / merge 时可给新 soul 写描述' },
           force: { type: 'boolean', description: 'delete 时必须传 true' },
         },
         required: ['action'],
@@ -1590,8 +1757,14 @@ export function apply(ctx, config) {
       },
       execute: async (input, exec) => {
         if (input.action === 'list') return store.soulCatalog(scopeOfExecution(exec))
-        if (input.action === 'create') return store.createSoul(input)
-        return store.deleteSoul(input)
+        if (input.action === 'copy') {
+          return store.copySoul({ from: input.name, to: input.target, description: input.description })
+        }
+        if (input.action === 'merge') {
+          return store.mergeSouls({ sources: input.sources, target: input.target, description: input.description })
+        }
+        if (input.action === 'delete') return store.deleteSoul(input)
+        return store.createSoul(input)
       },
     }),
     tool({
