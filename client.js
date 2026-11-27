@@ -716,7 +716,10 @@ window.__ModuleLoader__.load({
       const mergeSelected = () => {
         if (selected.length < 2) return
         runAction(post(MERGE_ROUTE, { sources: [...selected], target: targetName }), result =>
-          translate('merged').replace('{n}', String(result.copied)).replace('{n2}', String(result.skipped)))
+          translate('merged')
+            .replace('{n}', String(result.copied))
+            .replace('{n2}', String(result.mergedGroups ?? 0))
+            .replace('{n3}', String(result.skipped)))
       }
 
       const deleteSelected = () => {
@@ -804,6 +807,22 @@ window.__ModuleLoader__.load({
               notesEmpty: '这个 soul 还没有内容',
               notesFailed: '读取失败',
               showing: '只显示前 {n} 条',
+              copy: 'copy',
+              rename: 'rename',
+              merge: 'merge',
+              deleteSoul: 'delete',
+              mergeTarget: '合并后的 soul 名',
+              renamed: '已改名为 {n}',
+              copied: '已复制 {n} 条',
+              merged: '已合并 {n} 条，语义合并 {n2} 组，跳过 {n3} 条',
+              soulDeleted: '已删除，连带 {n} 条记忆',
+              selected: '已选 {n}',
+              confirm: '确认',
+              cancel: '取消',
+              confirmDelete: '确认删除',
+              deleteNote: '删除这条',
+              deleted: '已删除',
+              undo: '撤销',
             },
             en: {
               label: 'Souls',
@@ -824,6 +843,22 @@ window.__ModuleLoader__.load({
               notesEmpty: 'This soul has no notes yet',
               notesFailed: 'Could not load notes',
               showing: 'Showing the first {n}',
+              copy: 'copy',
+              rename: 'rename',
+              merge: 'merge',
+              deleteSoul: 'delete',
+              mergeTarget: 'Merged soul name',
+              renamed: 'Renamed to {n}',
+              copied: 'Copied {n} notes',
+              merged: 'Merged {n} notes, {n2} groups consolidated, {n3} skipped',
+              soulDeleted: 'Deleted with {n} notes',
+              selected: '{n} selected',
+              confirm: 'Confirm',
+              cancel: 'Cancel',
+              confirmDelete: 'Delete',
+              deleteNote: 'Delete this note',
+              deleted: 'Deleted',
+              undo: 'Undo',
             },
           }
           try {

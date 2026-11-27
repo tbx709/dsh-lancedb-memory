@@ -26,7 +26,7 @@ Embedded LanceDB memory for [DeepSeek Harness](https://github.com/deepseek-ai/de
 | `lancedb_store` | 写笔记，默认写当前会话；`soul: 'x'` 直接写进某个 soul（要先建） |
 | `lancedb_search` | 混合检索：当前会话 + 已挂载的 soul，`souls` 可临时改范围 |
 | `lancedb_promote` | 把会话里的 id 复制进 soul；`move: true` 复制后从会话删 |
-| `lancedb_souls` | `list` / `create`（要 description）/ `copy`（`name` → `target`）/ `merge`（`sources` → `target`，来源保留）/ `delete`（要 force: true） |
+| `lancedb_souls` | `list` / `create`（要 description）/ `copy`（`name` → `target`）/ `merge`（`sources` → `target`，来源保留；默认语义合并）/ `rename` / `delete`（要 force: true） |
 | `lancedb_attach` | 给当前会话挂载或卸下 soul |
 | `lancedb_list` | 按写入时间倒序列出当前会话或某个 soul |
 | `lancedb_forget` | 删会话里的记忆；删 soul 里的要显式传 `soul` |
@@ -45,7 +45,7 @@ Embedded LanceDB memory for [DeepSeek Harness](https://github.com/deepseek-ai/de
 - 面板底部的"管理"进入管理态，每行出现复选框，动作按钮统一英文：
   - `copy`：勾 1 个即可，目标名自动取 `<原名>-1`、`-2`…，不用手输。
   - `rename`：勾 1 个，行内出输入框改名字，条目和挂载关系跟着走。
-  - `merge`：勾 2 个以上并填目标名；来源 soul 保留，`kind` 和文本都相同的内容自动跳过。
+  - `merge`：勾 2 个以上并填目标名；来源 soul 保留。默认先按向量把相近笔记分组，再让当前 profile 的默认模型判断哪些是同一件事、并成一条，输出会保留具体数字、路径和结论；没有可用模型时退回"`kind` + 文本完全相同才跳过"的机械去重。
   - `delete`：勾 1 个，两步确认，连它记住的内容一起删。
 - 已挂载的芯片点一下就卸载，效果等同 agent 调 `lancedb_attach`，下一次检索立刻生效。
 - 没有 soul 时显示提示，让 agent 先用 `lancedb_souls` 建一个。
@@ -92,12 +92,24 @@ patch 行里的 `config` 全部可选：
         dedupe:
           enabled: true
           threshold: 0.95               # 同一 scope 下余弦相似度达到它就视为重复
+        merge:
+          similarity: 0.8               # 语义合并时先按这个余弦阈值把笔记分组成候选
 ```
 
 默认嵌入是本地字符 n-gram 哈希向量：离线可用，中文按字 + 二元组计分，检索偏词面相似。
 配 `provider: http` 后换成真正的语义向量，维度以第一次返回为准。
 
 换嵌入维度后旧表不兼容，需要换 `table` 名或清掉旧目录。
+
+## 语义合并怎么工作
+
+`merge` 默认走语义合并，分三步：
+
+1. 从来源 soul 收集笔记，丢掉 `kind` 和文本完全相同的重复项。
+2. 用向量把候选笔记聚成相似组（`merge.similarity`，默认 0.8 余弦），只把有邻居的组发给模型——不会把整个库塞进一次请求。
+3. 模型返回 `{groups:[{ids,text,kind,importance}]}`：合并后的正文写进目标 soul，来源 soul 一条不动；没被分组的笔记原样复制。
+
+约束：模型只输出 JSON，解析失败或没有模型可用时自动回退机械合并，并在返回值里带 `semantic:false` 和 `semanticError`。合并结果的 id 按新文本重新算，`createdAt` 重置为合并时间。
 
 ## 数据布局
 

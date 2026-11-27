@@ -25,7 +25,7 @@ const TOOLS = [
  * Minimal Cordis context: capture tools, services, and disposers.
  * @returns Fake context and its registries.
  */
-function createContext() {
+function createContext(options = {}) {
   const tools = new Map()
   const services = new Map()
   const disposers = []
@@ -46,6 +46,11 @@ function createContext() {
       const disposer = callback()
       if (typeof disposer === 'function') disposers.push(disposer)
       return disposer
+    },
+    get(name) {
+      if (name === 'llm') return options.llm
+      if (name === 'agentDefaultModel') return options.defaultModel
+      return undefined
     },
     inject(_deps, callback) {
       const scope = Object.create(ctx)
@@ -68,8 +73,8 @@ function createContext() {
  * @param {object} config - Row config.
  * @returns Tools, services, and a stop function.
  */
-function boot(config) {
-  const instance = createContext()
+function boot(config, options = {}) {
+  const instance = createContext(options)
   apply(instance.ctx, config)
   return {
     tools: instance.tools,
@@ -420,6 +425,58 @@ try {
     assert.ok(columns.includes(column), `migration added ${column}`)
   }
   migrated.stop()
+
+  // --- Semantic merge ------------------------------------------------------
+  const semanticDirectory = join(root, 'semantic')
+  const replyFor = prompt => {
+    const ids = [...prompt.matchAll(/- \[([0-9a-f]{32})\]/g)].map(match => match[1])
+    return JSON.stringify({
+      groups: [{ ids: ids.slice(0, 2), text: '合并后的唯一结论', kind: 'fact', importance: 9 }],
+    })
+  }
+  const semanticOptions = {
+    llm: {
+      async *stream({ messages }) {
+        yield { type: 'text-delta', text: replyFor(messages[0].content[0].text) }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    defaultModel: { currentSelection: () => ({ provider: 'fake', model: 'fake' }) },
+  }
+
+  const semantic = boot(configFor(semanticDirectory), semanticOptions)
+  await call(semantic.tools, 'lancedb_souls', { action: 'create', name: 'm1', description: '一' }, 'sm')
+  await call(semantic.tools, 'lancedb_souls', { action: 'create', name: 'm2', description: '二' }, 'sm')
+  await call(semantic.tools, 'lancedb_store', { soul: 'm1', text: '用户喜欢深色主题。', kind: 'preference' }, 'sm')
+  await call(semantic.tools, 'lancedb_store', { soul: 'm2', text: '用户喜欢深色主题！', kind: 'preference' }, 'sm')
+  const semanticMerge = await call(semantic.tools, 'lancedb_souls', {
+    action: 'merge', sources: ['m1', 'm2'], target: 'm-all',
+  }, 'sm')
+  assert.equal(semanticMerge.semantic, true)
+  assert.equal(semanticMerge.mergedGroups, 1)
+  assert.equal(semanticMerge.copied, 1)
+  const mergedNotes = await call(semantic.tools, 'lancedb_list', { soul: 'm-all' }, 'sm')
+  assert.equal(mergedNotes.memories.length, 1)
+  assert.equal(mergedNotes.memories[0].text, '合并后的唯一结论')
+  assert.equal(mergedNotes.memories[0].kind, 'fact')
+  assert.equal(mergedNotes.memories[0].importance, 9)
+  const sourceStill = await call(semantic.tools, 'lancedb_list', { soul: 'm1' }, 'sm')
+  assert.equal(sourceStill.memories.length, 1, 'sources survive a semantic merge')
+  semantic.stop()
+
+  const mechanical = boot(configFor(join(root, 'mechanical')))
+  await call(mechanical.tools, 'lancedb_souls', { action: 'create', name: 'n1', description: '一' }, 'sm')
+  await call(mechanical.tools, 'lancedb_souls', { action: 'create', name: 'n2', description: '二' }, 'sm')
+  await call(mechanical.tools, 'lancedb_store', { soul: 'n1', text: '用户喜欢深色主题。', kind: 'preference' }, 'sm')
+  await call(mechanical.tools, 'lancedb_store', { soul: 'n2', text: '用户喜欢深色主题！', kind: 'preference' }, 'sm')
+  const mechanicalMerge = await call(mechanical.tools, 'lancedb_souls', {
+    action: 'merge', sources: ['n1', 'n2'], target: 'n-all',
+  }, 'sm')
+  assert.equal(mechanicalMerge.semantic, false)
+  assert.equal(mechanicalMerge.mergedGroups, 0)
+  assert.equal(mechanicalMerge.copied, 2, 'without a model the merge stays mechanical')
+  assert.ok(typeof mechanicalMerge.semanticError === 'string')
+  mechanical.stop()
 
   // --- HTTP embedder -------------------------------------------------------
   let requestCount = 0

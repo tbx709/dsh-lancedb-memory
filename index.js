@@ -69,6 +69,7 @@ function resolveSettings(raw) {
   const embedding = isRecord(config.embedding) ? config.embedding : {}
   const search = isRecord(config.search) ? config.search : {}
   const dedupe = isRecord(config.dedupe) ? config.dedupe : {}
+  const merge = isRecord(config.merge) ? config.merge : {}
 
   const table = config.table ?? 'memories'
   if (typeof table !== 'string' || !TABLE_PATTERN.test(table)) {
@@ -107,6 +108,9 @@ function resolveSettings(raw) {
     dedupe: {
       enabled: dedupe.enabled ?? true,
       threshold: ratio(dedupe.threshold, 0.95, 'dedupe.threshold'),
+    },
+    merge: {
+      similarity: ratio(merge.similarity, 0.55, 'merge.similarity'),
     },
   }
 }
@@ -356,10 +360,15 @@ class MemoryStore {
   #ftsError
   #soulsFile
   #sessionsFile
+  #complete
 
-  /** @param {ReturnType<typeof resolveSettings>} settings - Resolved config. */
-  constructor(settings) {
+  /**
+   * @param {ReturnType<typeof resolveSettings>} settings - Resolved config.
+   * @param {(prompt: string) => Promise<string>} [complete] - One-shot model call for semantic merge.
+   */
+  constructor(settings, complete) {
     this.#settings = settings
+    this.#complete = complete
     this.#embedder = createEmbedder(settings.embedding)
     this.#soulsFile = new JsonStore(join(settings.directory, 'souls.json'))
     this.#sessionsFile = new JsonStore(join(settings.directory, 'sessions.json'))
@@ -725,52 +734,195 @@ class MemoryStore {
       await this.#writeSoul(target, { description })
     }
     const targetScope = soulScope(target)
+    const useSemantic = input.semantic !== false && typeof this.#complete === 'function'
+
+    const gathered = await this.#collectMergeCandidates(sources, targetScope)
+    let plans
+    let semanticError
+    if (useSemantic && gathered.candidates.length > 1) {
+      try {
+        plans = await this.#organizeMerge(gathered.candidates)
+      } catch (error) {
+        semanticError = errorMessage(error)
+      }
+    }
 
     return this.#serial(async () => {
-      const table = await this.#table()
-      const copied = []
-      const skipped = []
-      if (table !== undefined) {
-        await this.#prepare(table)
-        const byId = new Map()
-        for (const name of sources) {
-          const rows = await table.query().where(`scope = '${escapeSql(soulScope(name))}'`).toArray()
-          for (const row of rows) {
-            const id = hashId(targetScope, row.kind, row.text)
-            if (byId.has(id)) {
-              skipped.push({ from: name, text: row.text, reason: 'duplicate' })
-              continue
-            }
-            byId.set(id, { row, from: name })
-          }
-        }
-        const existingRows = await table.query().where(`scope = '${escapeSql(targetScope)}'`).select(['id']).toArray()
-        const present = new Set(existingRows.map(row => row.id))
+      let copied = 0
+      let skipped = gathered.skipped
+      let mergedGroups = 0
+      if (gathered.table !== undefined) {
+        const table = gathered.table
         const now = Date.now()
-        for (const [id, entry] of byId) {
-          if (present.has(id)) {
-            skipped.push({ from: entry.from, text: entry.row.text, reason: 'already-in-target' })
+        const consumed = new Set()
+        for (const plan of plans ?? []) {
+          const added = await this.#addMergedRow(table, targetScope, plan, gathered.present, now)
+          if (!added) {
+            skipped += plan.ids.length
             continue
           }
-          await table.add([{
-            id,
-            text: entry.row.text,
-            kind: entry.row.kind,
-            metadata: entry.row.metadata,
-            vector: Array.from(entry.row.vector),
-            createdAt: Number(entry.row.createdAt),
-            importance: Number(entry.row.importance ?? 5),
-            accessCount: 0,
-            lastAccessedAt: now,
-            updatedAt: now,
-            scope: targetScope,
-          }])
-          copied.push({ from: entry.from, id })
+          mergedGroups += 1
+          copied += 1
+          for (const id of plan.ids) consumed.add(id)
+        }
+        for (const candidate of gathered.candidates) {
+          if (consumed.has(candidate.id)) continue
+          const added = await this.#copyRowTo(table, targetScope, candidate, gathered.present, now)
+          if (added) copied += 1
+          else skipped += 1
         }
       }
-      if (copied.length > 0) await this.#touchSoul(target)
-      return { target, sources, copied: copied.length, skipped: skipped.length }
+      if (copied > 0) await this.#touchSoul(target)
+      return {
+        target,
+        sources,
+        copied,
+        skipped,
+        mergedGroups,
+        semantic: mergedGroups > 0,
+        ...semanticError === undefined ? {} : { semanticError },
+      }
     })
+  }
+
+  /**
+   * Read every note a merge would consider, dropping exact repeats and notes
+   * already present in the target.
+   * @param {string[]} sources - Source soul names.
+   * @param {string} targetScope - Destination scope.
+   * @returns Table plus candidate rows.
+   */
+  async #collectMergeCandidates(sources, targetScope) {
+    const table = await this.#table()
+    if (table === undefined) {
+      return { table: undefined, candidates: [], present: new Set(), skipped: 0 }
+    }
+    await this.#prepare(table)
+    const existingRows = await table.query()
+      .where(`scope = '${escapeSql(targetScope)}'`)
+      .select(['id'])
+      .toArray()
+    const present = new Set(existingRows.map(row => row.id))
+    const seen = new Set()
+    const candidates = []
+    let skipped = 0
+    for (const name of sources) {
+      const rows = await table.query().where(`scope = '${escapeSql(soulScope(name))}'`).toArray()
+      for (const row of rows) {
+        const id = hashId(targetScope, row.kind, row.text)
+        if (present.has(id) || seen.has(id)) {
+          skipped += 1
+          continue
+        }
+        seen.add(id)
+        candidates.push({ id, row, from: name })
+      }
+    }
+    return { table, candidates, present, skipped }
+  }
+
+  /**
+   * Ask the model which candidates say the same thing and how to word the
+   * merged note. Only embedding-neighbour groups reach the model, so a big
+   * merge does not ship the whole store to one prompt.
+   * @param {Array<{ id: string, row: any, from: string }>} candidates - Merge candidates.
+   * @returns Merge plans (possibly empty).
+   */
+  async #organizeMerge(candidates) {
+    const limit = 60
+    const reduced = candidates.slice(0, limit)
+    // Small merges hand every note to the model — a lexical embedder misses
+    // reworded duplicates, and the model is the better judge. Larger merges
+    // use embedding clusters only to bound the prompt.
+    const groups = reduced.length <= 40
+      ? (reduced.length > 1 ? [reduced] : [])
+      : clusterBySimilarity(reduced, this.#settings.merge.similarity).filter(group => group.length > 1)
+    if (groups.length === 0) return []
+    const included = groups.flat()
+    const lines = included
+      .map(candidate => `- [${candidate.id}] kind=${candidate.row.kind} importance=${Number(candidate.row.importance ?? 5)}`
+        + `\n  ${String(candidate.row.text).slice(0, 600)}`)
+      .join('\n')
+    const prompt = [
+      '你在整理一个长期记忆库。下面是准备合并进同一个 soul 的笔记，每条有 id、kind、importance 和正文。',
+      '',
+      '任务：找出表达同一件事的笔记（同义改写、重复记录、同一结论的不同说法），把它们合并成一条；不是同一件事的不要合并。',
+      '',
+      '规则：',
+      '- 合并后的文字保留所有具体事实：数字、路径、命令、规则、结论，不要概括丢细节。',
+      '- kind 用组内最合适的那个；importance 取组内最大值。',
+      '- 只合并真正重复的，宁可少合并。',
+      '- 只输出 JSON，不要解释，格式：',
+      '{"groups":[{"ids":["<id>","<id>"],"text":"合并后的正文","kind":"rule","importance":9}]}',
+      '没有需要合并的就输出 {"groups":[]}。',
+      '',
+      '笔记：',
+      lines,
+    ].join('\n')
+    const reply = await this.#complete(prompt)
+    return parseMergeReply(reply, new Set(reduced.map(candidate => candidate.id)))
+  }
+
+  /**
+   * Add one model-merged note to the target, embedding the new text.
+   * @param {any} table - Open table.
+   * @param {string} targetScope - Destination scope.
+   * @param {{ ids: string[], text: string, kind?: unknown, importance?: unknown }} plan - Merge plan.
+   * @param {Set<string>} present - Ids already in the target.
+   * @param {number} now - Timestamp.
+   * @returns Whether a row was written.
+   */
+  async #addMergedRow(table, targetScope, plan, present, now) {
+    const text = plan.text.trim().slice(0, MAX_TEXT)
+    if (text.length === 0) return false
+    const kind = safeKind(plan.kind)
+    const id = hashId(targetScope, kind, text)
+    if (present.has(id)) return false
+    const vector = await this.#embedder.embed(text)
+    await table.add([{
+      id,
+      text,
+      kind,
+      metadata: '{}',
+      vector,
+      createdAt: now,
+      importance: safeImportance(plan.importance),
+      accessCount: 0,
+      lastAccessedAt: now,
+      updatedAt: now,
+      scope: targetScope,
+    }])
+    present.add(id)
+    return true
+  }
+
+  /**
+   * Copy one source row into the target unchanged.
+   * @param {any} table - Open table.
+   * @param {string} targetScope - Destination scope.
+   * @param {{ id: string, row: any }} candidate - Source row.
+   * @param {Set<string>} present - Ids already in the target.
+   * @param {number} now - Timestamp.
+   * @returns Whether a row was written.
+   */
+  async #copyRowTo(table, targetScope, candidate, present, now) {
+    if (present.has(candidate.id)) return false
+    const row = candidate.row
+    await table.add([{
+      id: candidate.id,
+      text: row.text,
+      kind: row.kind,
+      metadata: row.metadata,
+      vector: Array.from(row.vector),
+      createdAt: Number(row.createdAt),
+      importance: Number(row.importance ?? 5),
+      accessCount: 0,
+      lastAccessedAt: now,
+      updatedAt: now,
+      scope: targetScope,
+    }])
+    present.add(candidate.id)
+    return true
   }
 
   /**
@@ -1226,6 +1378,151 @@ class MemoryStore {
 }
 
 /**
+ * Cosine similarity over two embedding vectors.
+ * @param {ArrayLike<number>} left - First vector.
+ * @param {ArrayLike<number>} right - Second vector.
+ * @returns Similarity, 0 when either vector is empty.
+ */
+function cosineSimilarity(left, right) {
+  const a = Array.from(left)
+  const b = Array.from(right)
+  const length = Math.min(a.length, b.length)
+  let dot = 0
+  let normA = 0
+  let normB = 0
+  for (let index = 0; index < length; index += 1) {
+    dot += a[index] * b[index]
+    normA += a[index] * a[index]
+    normB += b[index] * b[index]
+  }
+  if (normA === 0 || normB === 0) return 0
+  return dot / Math.sqrt(normA * normB)
+}
+
+/**
+ * Group merge candidates whose embeddings are at least `threshold` similar.
+ * @param {Array<{ id: string, row: any }>} candidates - Candidates.
+ * @param {number} threshold - Cosine threshold.
+ * @returns Arrays of candidates, including singleton groups.
+ */
+function clusterBySimilarity(candidates, threshold) {
+  const parent = candidates.map((_, index) => index)
+  const find = index => {
+    let root = index
+    while (parent[root] !== root) root = parent[root]
+    while (parent[index] !== root) {
+      const next = parent[index]
+      parent[index] = root
+      index = next
+    }
+    return root
+  }
+  for (let left = 0; left < candidates.length; left += 1) {
+    for (let right = left + 1; right < candidates.length; right += 1) {
+      if (cosineSimilarity(candidates[left].row.vector, candidates[right].row.vector) >= threshold) {
+        const rootLeft = find(left)
+        const rootRight = find(right)
+        if (rootLeft !== rootRight) parent[rootRight] = rootLeft
+      }
+    }
+  }
+  const groups = new Map()
+  candidates.forEach((candidate, index) => {
+    const root = find(index)
+    if (!groups.has(root)) groups.set(root, [])
+    groups.get(root).push(candidate)
+  })
+  return [...groups.values()]
+}
+
+/**
+ * Parse the model's merge plan, keeping only ids it was shown.
+ * @param {string} reply - Raw model text.
+ * @param {Set<string>} allowed - Candidate ids.
+ * @returns Accepted plans.
+ */
+function parseMergeReply(reply, allowed) {
+  if (typeof reply !== 'string' || reply.length === 0) throw new Error('模型没有返回内容')
+  const start = reply.indexOf('{')
+  const end = reply.lastIndexOf('}')
+  if (start < 0 || end <= start) throw new Error('模型没有返回 JSON')
+  let parsed
+  try {
+    parsed = JSON.parse(reply.slice(start, end + 1))
+  } catch {
+    throw new Error('模型返回的 JSON 解析失败')
+  }
+  const groups = Array.isArray(parsed?.groups) ? parsed.groups : []
+  const used = new Set()
+  const plans = []
+  for (const group of groups) {
+    if (!isRecord(group) || !Array.isArray(group.ids)) continue
+    if (typeof group.text !== 'string' || group.text.trim().length === 0) continue
+    const ids = [...new Set(group.ids)]
+      .filter(id => typeof id === 'string' && allowed.has(id) && !used.has(id))
+    if (ids.length < 2) continue
+    for (const id of ids) used.add(id)
+    plans.push({ ids, text: group.text.trim(), kind: group.kind, importance: group.importance })
+  }
+  return plans
+}
+
+/**
+ * Kind for a merged note, falling back to `note`.
+ * @param {unknown} value - Raw kind.
+ * @returns Normalized kind.
+ */
+function safeKind(value) {
+  try {
+    return normalizeKind(value)
+  } catch {
+    return 'note'
+  }
+}
+
+/**
+ * Importance for a merged note, clamped to 1-10.
+ * @param {unknown} value - Raw importance.
+ * @returns Integer importance.
+ */
+function safeImportance(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return 5
+  return Math.min(10, Math.max(1, Math.round(number)))
+}
+
+/**
+ * One-shot model call used for semantic merge. Reads the host `llm` service and
+ * the profile's default model at call time, so a model switch needs no reload.
+ * @param {any} ctx - Plugin context.
+ * @returns Async prompt-to-text function.
+ */
+function createCompleter(ctx) {
+  return async prompt => {
+    const llm = ctx.get('llm')
+    const selection = ctx.get('agentDefaultModel')?.currentSelection()
+    if (llm === undefined || selection === undefined) {
+      throw new Error('没有可用的模型，无法语义合并')
+    }
+    const messages = [{ role: 'user', content: [{ type: 'text', text: prompt }] }]
+    let text = ''
+    let failure
+    for await (const chunk of llm.stream({
+      provider: selection.provider,
+      model: selection.model,
+      system: '你只输出 JSON，不写解释。',
+      messages,
+      signal: AbortSignal.timeout(120_000),
+    })) {
+      if (chunk.type === 'text-delta') text += chunk.text
+      if (chunk.type === 'finish' && chunk.reason.kind === 'error') failure = chunk.reason.failure
+    }
+    if (failure !== undefined) throw new Error(failure.message)
+    return text
+  }
+}
+
+/**
  * Fuse vector and BM25 results, then apply the lifecycle multiplier.
  *
  * Vector similarity is already 0-1 for normalized embeddings; BM25 is unbounded,
@@ -1568,7 +1865,7 @@ function scopeOfExecution(exec) {
  */
 export function apply(ctx, config) {
   const settings = resolveSettings(config)
-  const store = new MemoryStore(settings)
+  const store = new MemoryStore(settings, createCompleter(ctx))
 
   ctx.effect(() => ctx.provide('lancedb', {
     describe: () => store.describe(),
@@ -1692,7 +1989,7 @@ export function apply(ctx, config) {
         try {
           const body = await request.json().catch(() => ({}))
           return Response.json(await store.mergeSouls({
-            sources: body.sources, target: body.target, description: body.description,
+            sources: body.sources, target: body.target, description: body.description, semantic: body.semantic,
           }))
         } catch (error) {
           return Response.json({ error: errorMessage(error) }, { status: 400 })
@@ -1822,6 +2119,10 @@ export function apply(ctx, config) {
             description: 'merge 的来源 soul 列表，合并后来源 soul 保留',
           },
           description: { type: 'string', description: 'create 时必填；copy / merge 时可给新 soul 写描述' },
+          semantic: {
+            type: 'boolean',
+            description: 'merge 时是否让模型理解后合并语义重复的笔记，默认 true；false 只按文本去重',
+          },
           force: { type: 'boolean', description: 'delete 时必须传 true' },
         },
         required: ['action'],
@@ -1836,7 +2137,12 @@ export function apply(ctx, config) {
           return store.renameSoul({ from: input.name, to: input.target })
         }
         if (input.action === 'merge') {
-          return store.mergeSouls({ sources: input.sources, target: input.target, description: input.description })
+          return store.mergeSouls({
+            sources: input.sources,
+            target: input.target,
+            description: input.description,
+            semantic: input.semantic,
+          })
         }
         if (input.action === 'delete') return store.deleteSoul(input)
         return store.createSoul(input)
