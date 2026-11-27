@@ -21,6 +21,8 @@ window.__ModuleLoader__.load({
     const SOULS_ROUTE = '/api/lancedb/souls'
     const ATTACH_ROUTE = '/api/lancedb/attach'
     const NOTES_ROUTE = '/api/lancedb/notes'
+    const DELETE_ROUTE = '/api/lancedb/delete'
+    const RESTORE_ROUTE = '/api/lancedb/restore'
     /** Attached chips beyond this collapse into a "+N" marker. */
     const MAX_ATTACHED_CHIPS = 8
     /** The filter box only appears once the list is worth filtering. */
@@ -47,6 +49,9 @@ window.__ModuleLoader__.load({
       notesEmpty: '这个 soul 还没有内容',
       notesFailed: '读取失败',
       showing: '只显示前 {n} 条',
+      deleteNote: '删除这条',
+      deleted: '已删除',
+      undo: '撤销',
     }
 
     const CSS = `
@@ -183,6 +188,29 @@ window.__ModuleLoader__.load({
 .dsh-ldb-souls-note-meta { display: flex; gap: 8px; opacity: .7; }
 .dsh-ldb-souls-note-kind { font-weight: 500; }
 .dsh-ldb-souls-note-text { white-space: pre-wrap; word-break: break-word; }
+.dsh-ldb-souls-note-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.dsh-ldb-souls-note-delete {
+  flex: none;
+  padding: 0 5px;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: .55;
+}
+.dsh-ldb-souls-note-delete:hover { color: var(--dsw-alias-state-error-primary); opacity: 1; }
+.dsh-ldb-souls-note-delete:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
+.dsh-ldb-souls-note-delete:disabled { opacity: .3; cursor: progress; }
+.dsh-ldb-souls-undo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px dashed var(--dsw-alias-border-l1);
+  border-radius: 6px;
+}
 `
 
     /**
@@ -224,12 +252,13 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * One soul's notes inside the picker.
-     * @param {{ status: string, notes: Array, total: number, error?: string }} preview - Preview state.
+     * One soul's notes inside the picker, each with a one-click delete.
+     * @param {{ name?: string, status: string, notes: Array, total: number, error?: string }} preview - Preview state.
      * @param {Function} t - Bound copy.
+     * @param {object} ui - Deleting id, last deletion, and callbacks.
      * @returns React element.
      */
-    function NotePreview(preview, t) {
+    function NotePreview(preview, t, ui) {
       if (preview.status === 'loading') {
         return h('div', { className: 'dsh-ldb-souls-muted' }, t('notesLoading'))
       }
@@ -239,12 +268,27 @@ window.__ModuleLoader__.load({
       if (preview.notes.length === 0) {
         return h('div', { className: 'dsh-ldb-souls-muted' }, t('notesEmpty'))
       }
+      const undoable = ui.lastDeleted !== undefined && ui.lastDeleted.soul === preview.name
       return h('div', { className: 'dsh-ldb-souls-notes' },
         preview.notes.map(note => h('article', { key: note.id, className: 'dsh-ldb-souls-note' },
-          h('div', { className: 'dsh-ldb-souls-note-meta' },
-            h('span', { className: 'dsh-ldb-souls-note-kind' }, note.kind),
-            h('time', null, dateText(note.createdAt))),
+          h('div', { className: 'dsh-ldb-souls-note-head' },
+            h('div', { className: 'dsh-ldb-souls-note-meta' },
+              h('span', { className: 'dsh-ldb-souls-note-kind' }, note.kind),
+              h('time', null, dateText(note.createdAt))),
+            h('button', {
+              type: 'button',
+              className: 'dsh-ldb-souls-note-delete',
+              'aria-label': t('deleteNote'),
+              title: t('deleteNote'),
+              disabled: ui.deleting === note.id,
+              onClick: () => ui.onDelete(note),
+            }, '\u00d7')),
           h('div', { className: 'dsh-ldb-souls-note-text' }, note.text))),
+        undoable
+          ? h('div', { className: 'dsh-ldb-souls-undo' },
+            h('span', null, t('deleted')),
+            h('button', { type: 'button', className: 'dsh-ldb-souls-link', onClick: ui.onUndo }, t('undo')))
+          : null,
         preview.total > preview.notes.length
           ? h('div', { className: 'dsh-ldb-souls-muted' }, fill(t('showing'), preview.notes.length))
           : null)
@@ -256,7 +300,7 @@ window.__ModuleLoader__.load({
      * @returns React element.
      */
     function SoulStripView(props) {
-      const { souls, attached, status, error, expanded, query, pending, preview, t } = props
+      const { souls, attached, status, error, expanded, query, pending, preview, deleting, lastDeleted, t } = props
       const attachedSouls = souls.filter(soul => attached.includes(soul.name))
       const shown = attachedSouls.slice(0, MAX_ATTACHED_CHIPS)
       const hidden = attachedSouls.length - shown.length
@@ -349,7 +393,14 @@ window.__ModuleLoader__.load({
                 'aria-expanded': isOpen,
                 onClick: () => props.onNotes(soul.name),
               }, isOpen ? t('hide') : t('view'))),
-            isOpen ? NotePreview(preview, t) : null)
+            isOpen
+              ? NotePreview(preview, t, {
+                deleting,
+                lastDeleted,
+                onDelete: props.onDelete,
+                onUndo: props.onUndo,
+              })
+              : null)
         })
         panel.push(h('div', { key: 'list', className: 'dsh-ldb-souls-list' },
           matches.length === 0
@@ -374,6 +425,8 @@ window.__ModuleLoader__.load({
       const [expanded, setExpanded] = React.useState(false)
       const [query, setQuery] = React.useState('')
       const [preview, setPreview] = React.useState({ name: undefined, status: 'idle', notes: [], total: 0 })
+      const [deleting, setDeleting] = React.useState(undefined)
+      const [lastDeleted, setLastDeleted] = React.useState(undefined)
 
       const load = React.useCallback(() => {
         if (sessionId === undefined) return
@@ -395,12 +448,7 @@ window.__ModuleLoader__.load({
         ).finally(() => setPending(undefined))
       }
 
-      const showNotes = name => {
-        if (preview.name === name) {
-          setPreview({ name: undefined, status: 'idle', notes: [], total: 0 })
-          return
-        }
-        setPreview({ name, status: 'loading', notes: [], total: 0 })
+      const loadNotes = React.useCallback(name => {
         post(NOTES_ROUTE, { soul: name, limit: NOTES_LIMIT }).then(
           data => setPreview(previous => previous.name === name
             ? { name, status: 'ready', notes: data.memories ?? [], total: data.total ?? 0 }
@@ -409,6 +457,45 @@ window.__ModuleLoader__.load({
             ? { name, status: 'error', notes: [], total: 0, error: error.message }
             : previous),
         )
+      }, [])
+
+      const showNotes = name => {
+        if (preview.name === name) {
+          setPreview({ name: undefined, status: 'idle', notes: [], total: 0 })
+          setLastDeleted(undefined)
+          return
+        }
+        setPreview({ name, status: 'loading', notes: [], total: 0 })
+        loadNotes(name)
+      }
+
+      const deleteNote = note => {
+        const soul = preview.name
+        if (deleting !== undefined || soul === undefined) return
+        setDeleting(note.id)
+        post(DELETE_ROUTE, { soul, id: note.id }).then(result => {
+          if (result.deleted !== true) throw new Error('这条已经不在了')
+          setPreview(previous => previous.name === soul
+            ? { ...previous, notes: previous.notes.filter(item => item.id !== note.id), total: Math.max(0, previous.total - 1) }
+            : previous)
+          setLastDeleted({ soul, note })
+        }).catch(error => setState(previous => ({ ...previous, error: error.message })))
+          .finally(() => setDeleting(undefined))
+      }
+
+      const undoDelete = () => {
+        if (lastDeleted === undefined) return
+        const { soul, note } = lastDeleted
+        post(RESTORE_ROUTE, {
+          soul,
+          text: note.text,
+          kind: note.kind,
+          metadata: note.metadata,
+          importance: note.importance,
+        }).then(() => {
+          setLastDeleted(undefined)
+          loadNotes(soul)
+        }).catch(error => setState(previous => ({ ...previous, error: error.message })))
       }
 
       if (sessionId === undefined) return null
@@ -422,12 +509,19 @@ window.__ModuleLoader__.load({
         query,
         pending,
         preview,
+        deleting,
+        lastDeleted,
         t: translate,
         onRetry: load,
-        onExpand: () => setExpanded(value => !value),
+        onExpand: () => {
+          if (expanded) setLastDeleted(undefined)
+          setExpanded(!expanded)
+        },
         onQuery: setQuery,
         onToggle: toggle,
         onNotes: showNotes,
+        onDelete: deleteNote,
+        onUndo: undoDelete,
       })
     }
 

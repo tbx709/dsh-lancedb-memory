@@ -226,9 +226,27 @@ try {
   assert.equal(again.copied.length, 0)
   assert.equal(again.skipped[0].reason, 'already-in-soul')
 
-  const previewNotes = await (await routePost(plugin.routes.get('/api/lancedb/notes'), { soul: 'writing' })).json()
+  const notesRouteAgain = plugin.routes.get('/api/lancedb/notes')
+  const previewNotes = await (await routePost(notesRouteAgain, { soul: 'writing' })).json()
   assert.equal(previewNotes.memories.length, 1)
   assert.match(previewNotes.memories[0].text, /文案标题/u)
+
+  // The picker deletes one note, then restores it from the undo snapshot.
+  const deleteRoute = plugin.routes.get('/api/lancedb/delete')
+  const restoreRoute = plugin.routes.get('/api/lancedb/restore')
+  assert.ok(deleteRoute, 'delete route is registered')
+  assert.ok(restoreRoute, 'restore route is registered')
+  const removedNote = await (await routePost(deleteRoute, { soul: 'writing', id: previewNotes.memories[0].id })).json()
+  assert.equal(removedNote.deleted, true)
+  assert.equal((await (await routePost(notesRouteAgain, { soul: 'writing' })).json()).memories.length, 0)
+  const restoredNote = await (await routePost(restoreRoute, {
+    soul: 'writing',
+    text: previewNotes.memories[0].text,
+    kind: previewNotes.memories[0].kind,
+    importance: previewNotes.memories[0].importance,
+  })).json()
+  assert.equal(restoredNote.created, true)
+  assert.equal((await (await routePost(notesRouteAgain, { soul: 'writing' })).json()).memories.length, 1)
 
   const foreign = await call(plugin.tools, 'lancedb_promote', { ids: [own.id], soul: 'writing' }, 'a')
   assert.equal(foreign.skipped[0].reason, 'not-in-session', 'cannot promote another session note')

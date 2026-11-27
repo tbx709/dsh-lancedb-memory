@@ -910,6 +910,31 @@ class MemoryStore {
   }
 
   /**
+   * Delete one note from a soul on behalf of the browser picker. The caller is
+   * already the owner Peer, so naming the soul is the whole authorization.
+   * @param {string} soul - Soul name.
+   * @param {string} id - Note id.
+   * @returns Whether a row was removed.
+   */
+  async deleteInSoul(soul, id) {
+    if (typeof id !== 'string' || !ID_PATTERN.test(id)) {
+      throw new Error('dsh-lancedb-memory: id 必须是 32 位十六进制字符串')
+    }
+    const scope = soulScope(soul)
+    return this.#serial(async () => {
+      const table = await this.#table()
+      if (table === undefined) return { id, deleted: false, total: 0 }
+      await this.#prepare(table)
+      const rows = await table.query().where(`id = '${id}'`).limit(1).toArray()
+      if (rows[0] === undefined || rows[0].scope !== scope) {
+        return { id, deleted: false, total: await table.countRows() }
+      }
+      await table.delete(`id = '${id}'`)
+      return { id, deleted: true, total: await table.countRows() }
+    })
+  }
+
+  /**
    * Browse notes newest first inside one scope.
    * @param {string} scope - Session or soul scope.
    * @param {{ kind?: string, limit?: number }} input - Listing request.
@@ -1433,6 +1458,40 @@ export function apply(ctx, config) {
           const name = normalizeSoulName(body.soul)
           const limit = Number.isInteger(body.limit) ? Math.min(Math.max(body.limit, 1), 100) : 50
           return Response.json(await store.list(soulScope(name), { limit }))
+        } catch (error) {
+          return Response.json({ error: errorMessage(error) }, { status: 400 })
+        }
+      },
+    }))
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/lancedb/delete',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const body = await request.json().catch(() => ({}))
+          const name = normalizeSoulName(body.soul)
+          return Response.json(await store.deleteInSoul(name, body.id))
+        } catch (error) {
+          return Response.json({ error: errorMessage(error) }, { status: 400 })
+        }
+      },
+    }))
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/lancedb/restore',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const body = await request.json().catch(() => ({}))
+          const name = normalizeSoulName(body.soul)
+          const stored = await store.store(soulScope(name), {
+            text: body.text,
+            kind: body.kind,
+            metadata: body.metadata,
+            importance: body.importance,
+          })
+          return Response.json(stored)
         } catch (error) {
           return Response.json({ error: errorMessage(error) }, { status: 400 })
         }
