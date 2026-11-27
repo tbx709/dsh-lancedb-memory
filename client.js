@@ -74,6 +74,7 @@ window.__ModuleLoader__.load({
       merged: '已合并 {n} 条，语义合并 {n2} 组，跳过 {n3} 条',
       mergedFallback: '模型不可用，按文本合并了 {n} 条',
       merging: '合并中…（模型在整理）',
+      close: '关闭',
       soulDeleted: '已删除，连带 {n} 条记忆',
     }
 
@@ -259,6 +260,44 @@ window.__ModuleLoader__.load({
 .dsh-ldb-souls-action.danger:hover:not(:disabled) { border-color: var(--dsw-alias-state-error-primary); }
 .dsh-ldb-souls-check { flex: none; margin: 0; cursor: pointer; }
 .dsh-ldb-souls-manage-status { opacity: .8; }
+.dsh-ldb-souls-hero-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.dsh-ldb-souls-hero-trigger:hover {
+  border-color: var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-primary);
+}
+.dsh-ldb-souls-dialog {
+  width: min(560px, calc(100vw - 32px));
+  max-height: min(80vh, 720px);
+  padding: 0;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-overlay);
+  color: var(--dsw-alias-label-primary);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, .25);
+}
+.dsh-ldb-souls-dialog::backdrop { background: rgba(0, 0, 0, .35); }
+.dsh-ldb-souls-dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px 8px;
+}
+.dsh-ldb-souls-dialog-body { padding: 0 14px 14px; max-height: 60vh; overflow: auto; }
+.dsh-ldb-souls-modal { padding: 0; }
+.dsh-ldb-souls-modal .dsh-ldb-souls-panel { border: 0; padding: 0; background: transparent; }
 `
 
     /**
@@ -371,7 +410,7 @@ window.__ModuleLoader__.load({
     function SoulStripView(props) {
       const {
         souls, attached, status, error, expanded, query, pending, preview, deleting, lastDeleted, t,
-        managing, selected, targetName, actionStatus, confirmDelete, acting,
+        managing, selected, targetName, actionStatus, confirmDelete, acting, modal,
       } = props
       const actionable = SOUL_NAME.test(targetName ?? '')
       const attachedSouls = souls.filter(soul => attached.includes(soul.name))
@@ -424,12 +463,19 @@ window.__ModuleLoader__.load({
         row.push(h('span', { key: 'stale', className: 'dsh-ldb-souls-error' }, error))
       }
 
-      const children = [
-        h('style', { key: 'style' }, CSS),
-        h('div', { key: 'row', className: 'dsh-ldb-souls-row' }, row),
-      ]
+      const children = [h('style', { key: 'style' }, CSS)]
+      if (!modal) {
+        children.push(h('div', { key: 'row', className: 'dsh-ldb-souls-row' }, row))
+      } else if (status === 'loading' && souls.length === 0) {
+        children.push(h('div', { key: 'loading', className: 'dsh-ldb-souls-muted' }, t('loading')))
+      } else if (status === 'error') {
+        children.push(h('div', { key: 'err', className: 'dsh-ldb-souls-error' }, error ?? t('failed')))
+        children.push(h('button', { key: 'retry', type: 'button', className: 'dsh-ldb-souls-link', onClick: props.onRetry }, t('retry')))
+      } else if (souls.length === 0) {
+        children.push(h('div', { key: 'empty', className: 'dsh-ldb-souls-muted' }, t('empty')))
+      }
 
-      if (expanded && status === 'ready' && souls.length > 0) {
+      if ((expanded || modal) && status === 'ready' && souls.length > 0) {
         const panel = []
         if (souls.length > FILTER_THRESHOLD) {
           panel.push(h('input', {
@@ -570,7 +616,11 @@ window.__ModuleLoader__.load({
         children.push(h('div', { key: 'panel', className: 'dsh-ldb-souls-panel', role: 'region', 'aria-label': t('label') }, panel))
       }
 
-      return h('div', { className: 'dsh-ldb-souls', role: 'group', 'aria-label': t('label') }, children)
+      return h('div', {
+        className: modal ? 'dsh-ldb-souls dsh-ldb-souls-modal' : 'dsh-ldb-souls',
+        role: 'group',
+        'aria-label': t('label'),
+      }, children)
     }
 
     /**
@@ -583,7 +633,7 @@ window.__ModuleLoader__.load({
       const translate = typeof props.t === 'function' ? props.t : key => FALLBACK[key] ?? key
       const [state, setState] = React.useState({ status: 'loading', souls: [], attached: [], error: undefined })
       const [pending, setPending] = React.useState(undefined)
-      const [expanded, setExpanded] = React.useState(false)
+      const [expanded, setExpanded] = React.useState(Boolean(props.modal))
       const [query, setQuery] = React.useState('')
       const [preview, setPreview] = React.useState({ name: undefined, status: 'idle', notes: [], total: 0 })
       const [deleting, setDeleting] = React.useState(undefined)
@@ -889,6 +939,7 @@ window.__ModuleLoader__.load({
         actionStatus,
         confirmDelete,
         acting,
+        modal: Boolean(props.modal),
         onManage: toggleManage,
         onSelect: selectSoul,
         onTarget: value => { setTargetName(value); setActionStatus(undefined) },
@@ -911,9 +962,62 @@ window.__ModuleLoader__.load({
       })
     }
 
+    /**
+     * New-session entry point: a compact trigger opening the picker in a native
+     * dialog, because the composer dock is not rendered before the first turn.
+     * @param {object} props - Slot props; `sessionId` identifies the session.
+     * @returns React element or null without a session.
+     */
+    function HeroSouls(props) {
+      const sessionId = props.sessionId
+      const translate = typeof props.t === 'function' ? props.t : key => FALLBACK[key] ?? key
+      const [open, setOpen] = React.useState(false)
+      if (sessionId === undefined) return null
+      return h(React.Fragment, null,
+        h('button', {
+          type: 'button',
+          className: 'dsh-ldb-souls-hero-trigger',
+          onClick: () => setOpen(true),
+        }, translate('label')),
+        open
+          ? h(SoulDialog, { sessionId, t: translate, onClose: () => setOpen(false) })
+          : null)
+    }
+
+    /**
+     * Native modal wrapper around the picker.
+     * @param {{ sessionId: string, t: Function, onClose: Function }} props - Dialog props.
+     * @returns React element.
+     */
+    function SoulDialog(props) {
+      const ref = React.useRef(null)
+      React.useEffect(() => {
+        const dialog = ref.current
+        if (dialog !== null && typeof dialog.showModal === 'function' && !dialog.open) {
+          try {
+            dialog.showModal()
+          } catch {
+            // A browser without modal support still renders the dialog content.
+          }
+        }
+      }, [])
+      return h('dialog', {
+        ref,
+        className: 'dsh-ldb-souls-dialog',
+        onCancel: event => { event.preventDefault(); props.onClose() },
+        onClick: event => { if (event.target === event.currentTarget) props.onClose() },
+      },
+      h('div', { className: 'dsh-ldb-souls-dialog-head' },
+        h('strong', null, props.t('label')),
+        h('button', { type: 'button', className: 'dsh-ldb-souls-link', onClick: props.onClose }, props.t('close'))),
+      h('div', { className: 'dsh-ldb-souls-dialog-body' },
+        h(SoulStrip, { sessionId: props.sessionId, t: props.t, modal: true })))
+    }
+
     // Exposed for headless verification without a browser.
     SoulStrip.View = SoulStripView
     SoulStrip.NextCopyName = nextCopyName
+    HeroSouls.Dialog = SoulDialog
 
     return {
       inject: ['slots'],
@@ -952,6 +1056,7 @@ window.__ModuleLoader__.load({
               merged: '已合并 {n} 条，语义合并 {n2} 组，跳过 {n3} 条',
               mergedFallback: '模型不可用，按文本合并了 {n} 条',
               merging: '合并中…（模型在整理）',
+              close: '关闭',
               soulDeleted: '已删除，连带 {n} 条记忆',
               selected: '已选 {n}',
               confirm: '确认',
@@ -992,6 +1097,7 @@ window.__ModuleLoader__.load({
               merged: 'Merged {n} notes, {n2} groups consolidated, {n3} skipped',
               mergedFallback: 'Model unavailable; merged {n} notes by text',
               merging: 'Merging… (the model is consolidating)',
+              close: 'Close',
               soulDeleted: 'Deleted with {n} notes',
               selected: '{n} selected',
               confirm: 'Confirm',
@@ -1014,6 +1120,12 @@ window.__ModuleLoader__.load({
           order: 2,
           locale: NS,
         }, SoulStrip))
+        ctx.slots.inject('conversation.hero.options', () => ctx.slots.register({
+          name: 'conversation.hero.options',
+          id: 'lancedb-souls-hero',
+          order: 10,
+          locale: NS,
+        }, HeroSouls))
       },
     }
   },
