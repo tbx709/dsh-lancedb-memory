@@ -91,7 +91,7 @@ patch 行里的 `config` 全部可选：
           trackAccess: true
         dedupe:
           enabled: true
-          threshold: 0.95               # 同一 scope 下余弦相似度达到它就视为重复
+          threshold: 0.95               # 同一 scope 下余弦达到它、且忽略空白/标点后文本一致才算重复
         merge:
           similarity: 0.8               # 语义合并时先按这个余弦阈值把笔记分组成候选
 ```

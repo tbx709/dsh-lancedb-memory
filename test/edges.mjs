@@ -205,6 +205,27 @@ try {
   assert.equal(new Set(raceRows.memories.map(row => row.id)).size, raceRows.memories.length, 'no duplicate ids from a merge race')
 
   await assert.rejects(souls({ action: 'explode' }), /action 只能是/u)
+
+  await assert.rejects(call(plugin.tools, 'lancedb_store', {}), /缺少参数 text/u)
+  await assert.rejects(call(plugin.tools, 'lancedb_attach', { souls: 'x' }), /数组/u)
+  await assert.rejects(call(plugin.tools, 'lancedb_search', { query: 'x', souls: 'x' }), /数组/u)
+
+  const taskOne = await call(plugin.tools, 'lancedb_store', { text: '任务 1 已完成', kind: 'task' })
+  const taskTwo = await call(plugin.tools, 'lancedb_store', { text: '任务 2 已完成', kind: 'task' })
+  assert.equal(taskTwo.created, true, 'notes that differ only by number stay distinct')
+  const taskCopy = await call(plugin.tools, 'lancedb_store', { text: '任务 1 已完成。', kind: 'task' })
+  assert.equal(taskCopy.duplicate, true, 'punctuation still dedupes when the numbers match')
+
+  const longRule = '线上事故处理流程：先回滚版本，再通知值班，最后补事故报告并复盘今天的全部问题'
+  const similarRule = '线上事故处理流程：先回滚版本，再通知值班，最后补事故报告并复演今天的全部问题'
+  await call(plugin.tools, 'lancedb_store', { text: longRule, kind: 'rule' })
+  const probe = await call(plugin.tools, 'lancedb_search', { query: similarRule, limit: 1 })
+  assert.ok(probe.results[0].similarity > 0.95, 'test needs a pair above the cosine threshold')
+  const oneChar = await call(plugin.tools, 'lancedb_store', { text: similarRule, kind: 'rule' })
+  assert.equal(oneChar.created, true, 'one character of meaning keeps the note distinct')
+  const punctRule = await call(plugin.tools, 'lancedb_store', { text: `${longRule}。`, kind: 'rule' })
+  assert.equal(punctRule.duplicate, true, 'formatting-only differences still dedupe')
+  assert.equal(taskOne.created, true)
   const stringFlag = await souls({
     action: 'merge', sources: ['beta'], target: 'flag-target', semantic: 'false',
   })
@@ -296,6 +317,74 @@ try {
   assert.equal(oldRows.length, 0)
   await db.close?.()
   ttl.stop()
+
+  // --- Config validation, empty souls, promote move, embed failures --------
+  const invalid = [
+    { table: '1bad' },
+    { topK: 0 },
+    { sessionTtlDays: -1 },
+    { embedding: { provider: 'nope' } },
+    { embedding: { provider: 'http', model: 'x' } },
+    { embedding: { provider: 'http', baseUrl: 'http://localhost' } },
+    { dedupe: { threshold: 2 } },
+    { merge: { similarity: -1 } },
+  ]
+  for (const config of invalid) {
+    assert.throws(() => boot({ ...configFor(join(root, 'invalid')), ...config }), /dsh-lancedb-memory/u)
+  }
+
+  const empty = boot(configFor(join(root, 'empty')))
+  const emptyStats = await call(empty.tools, 'lancedb_stats', {})
+  assert.equal(emptyStats.exists, false)
+  assert.equal(emptyStats.rows, 0)
+  await call(empty.tools, 'lancedb_souls', { action: 'create', name: 'blank', description: '空' })
+  const blankCopy = await call(empty.tools, 'lancedb_souls', { action: 'copy', name: 'blank', target: 'blank-copy' })
+  assert.equal(blankCopy.copied, 0)
+  const blankRename = await call(empty.tools, 'lancedb_souls', { action: 'rename', name: 'blank-copy', target: 'blank-renamed' })
+  assert.equal(blankRename.moved, 0)
+  empty.stop()
+
+  const mover = boot(configFor(join(root, 'move')))
+  await call(mover.tools, 'lancedb_souls', { action: 'create', name: 'target', description: '目标' })
+  const toMove = await call(mover.tools, 'lancedb_store', { text: '要搬走的笔记', kind: 'note' })
+  const moved = await call(mover.tools, 'lancedb_promote', { ids: [toMove.id], soul: 'target', move: true })
+  assert.equal(moved.copied.length, 1)
+  assert.equal(moved.moved, true)
+  const sourceLeft = await call(mover.tools, 'lancedb_list', {})
+  assert.equal(sourceLeft.memories.some(row => row.id === toMove.id), false)
+  const targetGot = await call(mover.tools, 'lancedb_list', { soul: 'target' })
+  assert.equal(targetGot.memories.length, 1)
+  mover.stop()
+
+  const { createServer } = await import('node:http')
+  const badServer = createServer((request, response) => {
+    response.writeHead(500, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ error: 'embedding down' }))
+  })
+  await new Promise(resolve => badServer.listen(0, '127.0.0.1', resolve))
+  const badPort = badServer.address().port
+  try {
+    const remoteBad = boot({
+      ...configFor(join(root, 'remote-bad')),
+      embedding: { provider: 'http', baseUrl: `http://127.0.0.1:${badPort}/v1`, model: 'x' },
+    })
+    await assert.rejects(call(remoteBad.tools, 'lancedb_store', { text: '远程失败' }), /embedding 接口返回 500/u)
+    remoteBad.stop()
+  } finally {
+    badServer.close()
+  }
+
+  const foreign = boot(configFor(join(root, 'foreign')))
+  await call(foreign.tools, 'lancedb_souls', { action: 'create', name: 'one', description: '1' })
+  await call(foreign.tools, 'lancedb_souls', { action: 'create', name: 'two', description: '2' })
+  const foreignNote = await call(foreign.tools, 'lancedb_store', { soul: 'one', text: '只属于 one', kind: 'note' })
+  const foreignDelete = await (await routePost(foreign.routes.get('/api/lancedb/delete'), {
+    soul: 'two', id: foreignNote.id,
+  })).json()
+  assert.equal(foreignDelete.deleted, false)
+  const oneStill = await call(foreign.tools, 'lancedb_list', { soul: 'one' })
+  assert.equal(oneStill.memories.length, 1)
+  foreign.stop()
 
   // --- Dimension mismatch ---------------------------------------------------
   const dimDirectory = join(root, 'dim')

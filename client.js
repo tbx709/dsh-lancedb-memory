@@ -71,7 +71,9 @@ window.__ModuleLoader__.load({
       cancel: '取消',
       confirmDelete: '确认删除',
       copied: '已复制 {n} 条',
-      merged: '已合并 {n} 条，跳过 {n2} 条重复',
+      merged: '已合并 {n} 条，语义合并 {n2} 组，跳过 {n3} 条',
+      mergedFallback: '模型不可用，按文本合并了 {n} 条',
+      merging: '合并中…（模型在整理）',
       soulDeleted: '已删除，连带 {n} 条记忆',
     }
 
@@ -332,7 +334,7 @@ window.__ModuleLoader__.load({
               className: 'dsh-ldb-souls-note-delete',
               'aria-label': t('deleteNote'),
               title: t('deleteNote'),
-              disabled: ui.deleting === note.id,
+              disabled: ui.deleting !== undefined,
               onClick: () => ui.onDelete(note),
             }, '\u00d7')),
           h('div', { className: 'dsh-ldb-souls-note-text' }, note.text))),
@@ -402,7 +404,7 @@ window.__ModuleLoader__.load({
             type: 'button',
             className: 'dsh-ldb-souls-chip',
             title: soul.description === undefined || soul.description.length === 0 ? soul.name : soul.description,
-            disabled: pending === soul.name,
+            disabled: pending !== undefined,
             onClick: () => props.onToggle(soul.name, false),
           }, h('span', { className: 'dsh-ldb-souls-name' }, soul.name)))
         }
@@ -463,7 +465,7 @@ window.__ModuleLoader__.load({
                 type: 'button',
                 className: 'dsh-ldb-souls-item-main',
                 'aria-pressed': isAttached,
-                disabled: pending === soul.name,
+                disabled: pending !== undefined,
                 onClick: () => props.onToggle(soul.name, !isAttached),
               },
               h('span', { className: 'dsh-ldb-souls-item-head' },
@@ -615,8 +617,9 @@ window.__ModuleLoader__.load({
         post(SOULS_ROUTE, { sessionId }).then(
           data => {
             if (seq !== loadSeq.current) return
-            const souls = data.souls ?? []
-            setState({ status: 'ready', souls, attached: data.attached ?? [], error: undefined })
+            const souls = Array.isArray(data.souls) ? data.souls : []
+            const attachedNow = Array.isArray(data.attached) ? data.attached : []
+            setState({ status: 'ready', souls, attached: attachedNow, error: undefined })
             // A soul deleted elsewhere must not stay selected for the next action.
             setSelected(previous => previous.filter(name => souls.some(soul => soul.name === name)))
             setConfirmDelete(previous => previous !== undefined && souls.some(soul => soul.name === previous)
@@ -667,7 +670,11 @@ window.__ModuleLoader__.load({
         post(ATTACH_ROUTE, { sessionId, souls: [name], detach: !wantAttached }).then(
           data => {
             if (sessionRef.current !== sessionId) return
-            setState(previous => ({ ...previous, attached: data.attached ?? [], error: undefined }))
+            setState(previous => ({
+              ...previous,
+              attached: Array.isArray(data.attached) ? data.attached : previous.attached,
+              error: undefined,
+            }))
           },
           error => {
             if (sessionRef.current !== sessionId) return
@@ -683,7 +690,12 @@ window.__ModuleLoader__.load({
       const loadNotes = React.useCallback(name => {
         post(NOTES_ROUTE, { soul: name, limit: NOTES_LIMIT }).then(
           data => setPreview(previous => previous.name === name
-            ? { name, status: 'ready', notes: data.memories ?? [], total: data.total ?? 0 }
+            ? {
+              name,
+              status: 'ready',
+              notes: Array.isArray(data.memories) ? data.memories : [],
+              total: Number.isFinite(data.total) ? data.total : 0,
+            }
             : previous),
           error => setPreview(previous => previous.name === name
             ? { name, status: 'error', notes: [], total: 0, error: error.message }
@@ -863,6 +875,7 @@ window.__ModuleLoader__.load({
         onRetry: load,
         onExpand: () => {
           if (expanded) setLastDeleted(undefined)
+          else load()
           setExpanded(!expanded)
         },
         onQuery: setQuery,

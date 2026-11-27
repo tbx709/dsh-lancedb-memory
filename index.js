@@ -640,9 +640,14 @@ class MemoryStore {
         await this.#prepare(table)
         const rows = await table.query().where(`scope = '${escapeSql(soulScope(from))}'`).toArray()
         const now = Date.now()
+        const seen = new Set()
+        const toAdd = []
         for (const row of rows) {
-          await table.add([{
-            id: hashId(target, row.kind, row.text),
+          const id = hashId(target, row.kind, row.text)
+          if (seen.has(id)) continue
+          seen.add(id)
+          toAdd.push({
+            id,
             text: row.text,
             kind: row.kind,
             metadata: row.metadata,
@@ -653,9 +658,10 @@ class MemoryStore {
             lastAccessedAt: now,
             updatedAt: now,
             scope: target,
-          }])
-          copied += 1
+          })
         }
+        await this.#addRows(table, toAdd)
+        copied = toAdd.length
       }
       await this.#writeSoul(to, { description })
       return { from, to, copied }
@@ -685,9 +691,14 @@ class MemoryStore {
         await this.#prepare(table)
         const rows = await table.query().where(`scope = '${escapeSql(soulScope(from))}'`).toArray()
         const now = Date.now()
+        const seen = new Set()
+        const toAdd = []
         for (const row of rows) {
-          await table.add([{
-            id: hashId(target, row.kind, row.text),
+          const id = hashId(target, row.kind, row.text)
+          if (seen.has(id)) continue
+          seen.add(id)
+          toAdd.push({
+            id,
             text: row.text,
             kind: row.kind,
             metadata: row.metadata,
@@ -698,9 +709,10 @@ class MemoryStore {
             lastAccessedAt: Number(row.lastAccessedAt ?? row.createdAt ?? now),
             updatedAt: now,
             scope: target,
-          }])
-          moved += 1
+          })
         }
+        await this.#addRows(table, toAdd)
+        moved = toAdd.length
         if (rows.length > 0) await table.delete(`scope = '${escapeSql(soulScope(from))}'`)
       }
       await this.#soulsFile.update(current => {
@@ -774,6 +786,7 @@ class MemoryStore {
       if (table !== undefined) {
         const now = Date.now()
         const consumed = new Set()
+        const toAdd = []
         // A concurrent merge into the same target may have landed while the
         // model was thinking; recompute presence before writing anything.
         const latest = await table.query()
@@ -782,22 +795,29 @@ class MemoryStore {
           .toArray()
         for (const row of latest) gathered.present.add(row.id)
         for (const plan of plans ?? []) {
-          const added = await this.#addMergedRow(table, targetScope, plan, gathered.present, now)
-          if (!added) {
+          const row = await this.#mergedRow(targetScope, plan, now)
+          if (row === undefined || gathered.present.has(row.id)) {
             for (const id of plan.ids) consumed.add(id)
             skipped += plan.ids.length
             continue
           }
+          toAdd.push(row)
+          gathered.present.add(row.id)
+          for (const id of plan.ids) consumed.add(id)
           mergedGroups += 1
           copied += 1
-          for (const id of plan.ids) consumed.add(id)
         }
         for (const candidate of gathered.candidates) {
           if (consumed.has(candidate.id)) continue
-          const added = await this.#copyRowTo(table, targetScope, candidate, gathered.present, now)
-          if (added) copied += 1
-          else skipped += 1
+          if (gathered.present.has(candidate.id)) {
+            skipped += 1
+            continue
+          }
+          toAdd.push(this.#copyRow(targetScope, candidate, now))
+          gathered.present.add(candidate.id)
+          copied += 1
         }
+        await this.#addRows(table, toAdd)
       }
       if (copied > 0) await this.#touchSoul(target)
       return {
@@ -899,15 +919,13 @@ class MemoryStore {
    * @param {number} now - Timestamp.
    * @returns Whether a row was written.
    */
-  async #addMergedRow(table, targetScope, plan, present, now) {
+  async #mergedRow(targetScope, plan, now) {
     const text = plan.text.trim().slice(0, MAX_TEXT)
-    if (text.length === 0) return false
+    if (text.length === 0) return undefined
     const kind = safeKind(plan.kind)
-    const id = hashId(targetScope, kind, text)
-    if (present.has(id)) return false
     const vector = await this.#embedder.embed(text)
-    await table.add([{
-      id,
+    return {
+      id: hashId(targetScope, kind, text),
       text,
       kind,
       metadata: '{}',
@@ -918,24 +936,19 @@ class MemoryStore {
       lastAccessedAt: now,
       updatedAt: now,
       scope: targetScope,
-    }])
-    present.add(id)
-    return true
+    }
   }
 
   /**
-   * Copy one source row into the target unchanged.
-   * @param {any} table - Open table.
+   * Build one copied row for the target scope.
    * @param {string} targetScope - Destination scope.
    * @param {{ id: string, row: any }} candidate - Source row.
-   * @param {Set<string>} present - Ids already in the target.
    * @param {number} now - Timestamp.
-   * @returns Whether a row was written.
+   * @returns Row to add.
    */
-  async #copyRowTo(table, targetScope, candidate, present, now) {
-    if (present.has(candidate.id)) return false
+  #copyRow(targetScope, candidate, now) {
     const row = candidate.row
-    await table.add([{
+    return {
       id: candidate.id,
       text: row.text,
       kind: row.kind,
@@ -947,9 +960,19 @@ class MemoryStore {
       lastAccessedAt: now,
       updatedAt: now,
       scope: targetScope,
-    }])
-    present.add(candidate.id)
-    return true
+    }
+  }
+
+  /**
+   * Append rows in bounded batches; large soul moves stay inside the tool timeout.
+   * @param {any} table - Open table.
+   * @param {Array<Record<string, unknown>>} rows - Rows to append.
+   */
+  async #addRows(table, rows) {
+    const batch = 256
+    for (let index = 0; index < rows.length; index += batch) {
+      await table.add(rows.slice(index, index + batch))
+    }
   }
 
   /**
@@ -1006,6 +1029,9 @@ class MemoryStore {
   async attach(sessionScopeValue, input) {
     const id = sessionIdOf(sessionScopeValue)
     if (id === undefined) throw new Error('dsh-lancedb-memory: 只能在会话里挂载 soul')
+    if (input.souls !== undefined && !Array.isArray(input.souls)) {
+      throw new Error('dsh-lancedb-memory: souls 必须是数组')
+    }
     const names = Array.isArray(input.souls) ? input.souls.map(normalizeSoulName) : []
     const detach = input.detach === true
     return this.#serial(async () => {
@@ -1078,7 +1104,8 @@ class MemoryStore {
           .where(`${scopePredicate([scope])} AND kind = '${escapeSql(kind)}'`).toArray()
           .catch(() => [])
         const similarity = near.length === 0 ? -1 : 1 - near[0]._distance
-        if (similarity >= this.#settings.dedupe.threshold) {
+        if (similarity >= this.#settings.dedupe.threshold
+          && dedupeForm(near[0].text) === dedupeForm(text)) {
           return {
             id: near[0].id, scope, kind, created: false, duplicate: true,
             similarity: round(similarity), total: await table.countRows(), dimension: vector.length,
@@ -1213,7 +1240,8 @@ class MemoryStore {
             .where(`${scopePredicate([target])} AND kind = '${escapeSql(row.kind)}'`).toArray()
             .catch(() => [])
           const similarity = near.length === 0 ? -1 : 1 - near[0]._distance
-          if (similarity >= this.#settings.dedupe.threshold) {
+          if (similarity >= this.#settings.dedupe.threshold
+            && dedupeForm(near[0].text) === dedupeForm(row.text)) {
             skipped.push({ id, reason: 'duplicate', similarity: round(similarity) })
             continue
           }
@@ -1764,6 +1792,20 @@ function parseMetadata(value) {
 }
 
 /**
+ * Form used by near-duplicate suppression: case, whitespace, and punctuation
+ * are ignored, but every word, digit, and symbol still has to match. Reworded
+ * notes stay distinct; only formatting variants collapse.
+ * @param {unknown} text - Note text.
+ * @returns Comparable form.
+ */
+function dedupeForm(text) {
+  return String(text)
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\s\p{P}]+/gu, '')
+}
+
+/**
  * Stable id for a note inside one scope.
  * @param {string} scope - Target scope.
  * @param {string} kind - Kind label.
@@ -1879,6 +1921,7 @@ function jsonContent(value) {
  * @returns Tool definition.
  */
 function tool(spec) {
+  const required = Array.isArray(spec.parameters.required) ? spec.parameters.required : []
   return {
     name: spec.name,
     description: spec.description,
@@ -1888,7 +1931,13 @@ function tool(spec) {
       schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => jsonContent(value),
     },
-    execute: spec.execute,
+    async execute(args, exec) {
+      if (!isRecord(args)) throw new Error(`dsh-lancedb-memory: ${spec.name} 的参数必须是 JSON 对象`)
+      for (const key of required) {
+        if (args[key] === undefined) throw new Error(`dsh-lancedb-memory: ${spec.name} 缺少参数 ${key}`)
+      }
+      return spec.execute(args, exec)
+    },
   }
 }
 
@@ -2078,7 +2127,7 @@ export function apply(ctx, config) {
     tool({
       name: 'lancedb_store',
       description: '把一条笔记写进记忆库并返回 id。默认写当前会话；指定 soul 时直接写进那个 soul（soul 要先建）。'
-        + '同样的 scope、kind 和文本重复写入不会产生重复行。',
+        + '同样的 scope、kind 和文本重复写入不会产生重复行；只差空白或标点的写法也视为同一条。',
       parameters: {
         type: 'object',
         properties: {
@@ -2128,6 +2177,9 @@ export function apply(ctx, config) {
       },
       execute: async (input, exec) => {
         const session = scopeOfExecution(exec)
+        if (input.souls !== undefined && !Array.isArray(input.souls)) {
+          throw new Error('dsh-lancedb-memory: souls 必须是数组')
+        }
         const explicit = input.souls === undefined
           ? await store.attachedSouls(session)
           : input.souls.map(normalizeSoulName)
