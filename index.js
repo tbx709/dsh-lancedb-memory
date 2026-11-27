@@ -645,6 +645,65 @@ class MemoryStore {
   }
 
   /**
+   * Rename a soul: move its notes under the new scope, keep the description and
+   * creation time, and update every session attachment that named the old name.
+   * @param {{ from: unknown, to: unknown }} input - Request.
+   * @returns Move summary.
+   */
+  async renameSoul(input) {
+    const from = normalizeSoulName(input.from)
+    const to = normalizeSoulName(input.to)
+    if (from === to) throw new Error('dsh-lancedb-memory: 新名字和原来一样')
+    await this.#requireSoul(from)
+    const souls = await this.#souls()
+    if (souls[to] !== undefined) throw new Error(`dsh-lancedb-memory: soul "${to}" 已存在`)
+    const entry = souls[from]
+    const target = soulScope(to)
+
+    return this.#serial(async () => {
+      const table = await this.#table()
+      let moved = 0
+      if (table !== undefined) {
+        await this.#prepare(table)
+        const rows = await table.query().where(`scope = '${escapeSql(soulScope(from))}'`).toArray()
+        const now = Date.now()
+        for (const row of rows) {
+          await table.add([{
+            id: hashId(target, row.kind, row.text),
+            text: row.text,
+            kind: row.kind,
+            metadata: row.metadata,
+            vector: Array.from(row.vector),
+            createdAt: Number(row.createdAt),
+            importance: Number(row.importance ?? 5),
+            accessCount: Number(row.accessCount ?? 0),
+            lastAccessedAt: Number(row.lastAccessedAt ?? row.createdAt ?? now),
+            updatedAt: now,
+            scope: target,
+          }])
+          moved += 1
+        }
+        if (rows.length > 0) await table.delete(`scope = '${escapeSql(soulScope(from))}'`)
+      }
+      await this.#soulsFile.update(current => {
+        const next = { ...current }
+        delete next[from]
+        next[to] = { description: entry.description, createdAt: entry.createdAt, lastUpdatedAt: Date.now() }
+        return next
+      })
+      await this.#sessionsFile.update(current => {
+        const next = {}
+        for (const [session, value] of Object.entries(current)) {
+          const names = Array.isArray(value?.souls) ? value.souls.map(name => name === from ? to : name) : []
+          if (names.length > 0) next[session] = { ...value, souls: [...new Set(names)] }
+        }
+        return next
+      })
+      return { from, to, moved }
+    })
+  }
+
+  /**
    * Merge several souls into one target, keeping every source as it was. Notes
    * that already exist in the target (same kind and text) are skipped.
    * @param {{ sources: unknown, target: unknown, description?: unknown }} input - Request.
@@ -1653,6 +1712,19 @@ export function apply(ctx, config) {
         }
       },
     }))
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/lancedb/souls/rename',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const body = await request.json().catch(() => ({}))
+          return Response.json(await store.renameSoul({ from: body.from, to: body.to }))
+        } catch (error) {
+          return Response.json({ error: errorMessage(error) }, { status: 400 })
+        }
+      },
+    }))
   })
 
   const tools = [
@@ -1732,17 +1804,17 @@ export function apply(ctx, config) {
     }),
     tool({
       name: 'lancedb_souls',
-      description: '管理 soul：list 列表，create 新建，copy 复制成新 soul，merge 合并多个（来源保留），'
-        + 'delete 连内容一起删（要 force: true）。',
+      description: '管理 soul：list 列表，create 新建，copy 复制成新 soul，rename 改名，'
+        + 'merge 合并多个（来源保留），delete 连内容一起删（要 force: true）。',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ['list', 'create', 'copy', 'merge', 'delete'],
+            enum: ['list', 'create', 'copy', 'rename', 'merge', 'delete'],
             description: '要做的操作',
           },
-          name: { type: 'string', description: 'copy 的来源 / delete 的目标；小写字母、数字、_ 和 -，最长 32' },
+          name: { type: 'string', description: 'copy / rename / delete 的来源 soul；小写字母、数字、_ 和 -，最长 32' },
           target: { type: 'string', description: 'copy / merge 的目标 soul 名；merge 时不存在会自动新建' },
           sources: {
             type: 'array',
@@ -1759,6 +1831,9 @@ export function apply(ctx, config) {
         if (input.action === 'list') return store.soulCatalog(scopeOfExecution(exec))
         if (input.action === 'copy') {
           return store.copySoul({ from: input.name, to: input.target, description: input.description })
+        }
+        if (input.action === 'rename') {
+          return store.renameSoul({ from: input.name, to: input.target })
         }
         if (input.action === 'merge') {
           return store.mergeSouls({ sources: input.sources, target: input.target, description: input.description })

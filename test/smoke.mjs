@@ -274,14 +274,27 @@ try {
   const catalogAfter = await (await routePost(soulsRoute, { sessionId: 'ui' })).json()
   assert.deepEqual(catalogAfter.souls.map(soul => soul.name), ['writing'])
 
+  const renameRoute = plugin.routes.get('/api/lancedb/souls/rename')
+  assert.ok(renameRoute, 'rename route is registered')
+  const renamed = await (await routePost(renameRoute, { from: 'writing', to: 'writing-renamed' })).json()
+  assert.equal(renamed.moved, 1)
+  assert.equal((await (await routePost(notesRouteAgain, { soul: 'writing-renamed' })).json()).memories.length, 1)
+  assert.equal((await (await routePost(notesRouteAgain, { soul: 'writing' })).json()).memories.length, 0)
+  const backAgain = await (await routePost(renameRoute, { from: 'writing-renamed', to: 'writing' })).json()
+  assert.equal(backAgain.moved, 1)
+
   // The same operations through the agent tool.
   const toolCopy = await call(plugin.tools, 'lancedb_souls', { action: 'copy', name: 'writing', target: 'tool-copy' }, 'a')
   assert.equal(toolCopy.copied, 1)
+  const toolRename = await call(plugin.tools, 'lancedb_souls', {
+    action: 'rename', name: 'tool-copy', target: 'tool-copy2',
+  }, 'a')
+  assert.equal(toolRename.moved, 1)
   const toolMerge = await call(plugin.tools, 'lancedb_souls', {
-    action: 'merge', sources: ['tool-copy'], target: 'tool-all',
+    action: 'merge', sources: ['tool-copy2'], target: 'tool-all',
   }, 'a')
   assert.equal(toolMerge.copied, 1)
-  await call(plugin.tools, 'lancedb_souls', { action: 'delete', name: 'tool-copy', force: true }, 'a')
+  await call(plugin.tools, 'lancedb_souls', { action: 'delete', name: 'tool-copy2', force: true }, 'a')
   await call(plugin.tools, 'lancedb_souls', { action: 'delete', name: 'tool-all', force: true }, 'a')
 
   const foreign = await call(plugin.tools, 'lancedb_promote', { ids: [own.id], soul: 'writing' }, 'a')

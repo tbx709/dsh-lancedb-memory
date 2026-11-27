@@ -40,12 +40,16 @@ Embedded LanceDB memory for [DeepSeek Harness](https://github.com/deepseek-ai/de
 
 - 折叠状态只显示当前会话已挂载的 soul 芯片，超过 8 个折成"还有 N 个"，soul 再多也不会撑高输入框。
 - 点"选择 (N)"展开挑选面板：soul 超过 6 个时带筛选框，列表最高 320px 可滚动，每行显示描述和条数，点一下挂载/卸载。
-- 每行右侧的"查看"展开这个 soul 的记忆原文（最多 50 条，带 kind 和日期），不用叫 agent 就能核对内容；再点"收起"合上。
+- 每行右侧的 "view" 展开这个 soul 的记忆原文（最多 50 条，带 kind 和日期），不用叫 agent 就能核对内容；再点 "hide" 合上。
 - 每条原文右上角的"×"点一下就删，删除只影响该 soul（所有会话共享）；紧接着面板里出现"已删除 · 撤销"，撤销会按原文本、kind、重要度重新写入，但 id 和创建时间会变。
-- 面板底部的"管理"进入管理态：每行出现复选框；勾 1 个 soul 填目标名可"复制"，勾 2 个以上可"合并"（来源 soul 保留，重名内容自动跳过），勾 1 个可"删除"（两步确认，连它记住的内容一起删）。
+- 面板底部的"管理"进入管理态，每行出现复选框，动作按钮统一英文：
+  - `copy`：勾 1 个即可，目标名自动取 `<原名>-1`、`-2`…，不用手输。
+  - `rename`：勾 1 个，行内出输入框改名字，条目和挂载关系跟着走。
+  - `merge`：勾 2 个以上并填目标名；来源 soul 保留，`kind` 和文本都相同的内容自动跳过。
+  - `delete`：勾 1 个，两步确认，连它记住的内容一起删。
 - 已挂载的芯片点一下就卸载，效果等同 agent 调 `lancedb_attach`，下一次检索立刻生效。
 - 没有 soul 时显示提示，让 agent 先用 `lancedb_souls` 建一个。
-- 浏览器只走八个 owner-only 路由：`/api/lancedb/souls`（列表）、`/attach`、`/notes`、`/delete`（删一条）、`/restore`（撤销）、`/souls/copy`、`/souls/merge`、`/souls/delete`，全部挂在已鉴权的 `/api` 通道上。
+- 浏览器只走九个 owner-only 路由：`/api/lancedb/souls`（列表）、`/attach`、`/notes`、`/delete`（删一条）、`/restore`（撤销）、`/souls/copy`、`/souls/rename`、`/souls/merge`、`/souls/delete`，全部挂在已鉴权的 `/api` 通道上。
 
 ## 排序怎么算
 

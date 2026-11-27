@@ -26,6 +26,7 @@ window.__ModuleLoader__.load({
     const COPY_ROUTE = '/api/lancedb/souls/copy'
     const MERGE_ROUTE = '/api/lancedb/souls/merge'
     const DELETE_SOUL_ROUTE = '/api/lancedb/souls/delete'
+    const RENAME_ROUTE = '/api/lancedb/souls/rename'
     const SOUL_NAME = /^[a-z0-9][a-z0-9_-]{0,31}$/
     /** Attached chips beyond this collapse into a "+N" marker. */
     const MAX_ATTACHED_CHIPS = 8
@@ -47,8 +48,8 @@ window.__ModuleLoader__.load({
       noMatch: '没有匹配的 soul',
       more: '还有 {n} 个',
       notes: '{n} 条',
-      view: '查看',
-      hide: '收起',
+      view: 'view',
+      hide: 'hide',
       notesLoading: '读取中…',
       notesEmpty: '这个 soul 还没有内容',
       notesFailed: '读取失败',
@@ -59,9 +60,12 @@ window.__ModuleLoader__.load({
       manage: '管理',
       exitManage: '退出管理',
       target: '目标 soul 名',
-      copy: '复制',
-      merge: '合并',
-      deleteSoul: '删除',
+      copy: 'copy',
+      rename: 'rename',
+      merge: 'merge',
+      deleteSoul: 'delete',
+      mergeTarget: '合并后的 soul 名',
+      renamed: '已改名为 {n}',
       selected: '已选 {n}',
       confirm: '确认',
       cancel: '取消',
@@ -337,6 +341,21 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * First free `<source>-N` copy target.
+     * @param {string} source - Soul being copied.
+     * @param {string[]} names - Existing soul names.
+     * @returns Free target name.
+     */
+    function nextCopyName(source, names) {
+      for (let index = 1; index < 1000; index += 1) {
+        const suffix = `-${index}`
+        const candidate = `${source.slice(0, 32 - suffix.length)}${suffix}`
+        if (!names.includes(candidate) && SOUL_NAME.test(candidate)) return candidate
+      }
+      throw new Error('没有可用的名字')
+    }
+
+    /**
      * Pure presentation: attached chips, the picker panel, and note previews.
      * @param {object} props - Souls, attachment state, preview state, callbacks.
      * @returns React element.
@@ -472,6 +491,8 @@ window.__ModuleLoader__.load({
         panel.push(h('div', { key: 'manage-toggle', className: 'dsh-ldb-souls-manage-row' }, manage))
 
         if (managing) {
+          const one = selected.length === 1
+          const many = selected.length >= 2
           const confirm = confirmDelete === undefined
             ? null
             : h('div', { key: 'confirm', className: 'dsh-ldb-souls-manage-row' },
@@ -480,39 +501,60 @@ window.__ModuleLoader__.load({
                 type: 'button', className: 'dsh-ldb-souls-action danger', onClick: props.onDeleteConfirmed,
               }, t('confirm')),
               h('button', { type: 'button', className: 'dsh-ldb-souls-link', onClick: props.onCancelDelete }, t('cancel')))
-          panel.push(h('div', { key: 'manage', className: 'dsh-ldb-souls-manage' },
-            h('div', { className: 'dsh-ldb-souls-manage-row' },
+
+          const editor = props.renaming
+            ? h('div', { key: 'rename', className: 'dsh-ldb-souls-manage-row' },
               h('input', {
                 className: 'dsh-ldb-souls-filter',
                 type: 'text',
-                value: targetName,
-                placeholder: t('target'),
-                'aria-label': t('target'),
-                onChange: event => props.onTarget(event.target.value),
+                value: props.renameValue,
+                'aria-label': t('rename'),
+                onChange: event => props.onRenameValue(event.target.value),
               }),
               h('button', {
                 type: 'button',
                 className: 'dsh-ldb-souls-action',
-                disabled: selected.length !== 1 || !actionable,
-                onClick: props.onCopy,
+                disabled: !SOUL_NAME.test(props.renameValue ?? '') || props.renameValue === selected[0],
+                onClick: props.onRenameConfirmed,
+              }, t('confirm')),
+              h('button', { type: 'button', className: 'dsh-ldb-souls-link', onClick: props.onCancelRename }, t('cancel')))
+            : many
+              ? h('div', { key: 'merge-target', className: 'dsh-ldb-souls-manage-row' },
+                h('input', {
+                  className: 'dsh-ldb-souls-filter',
+                  type: 'text',
+                  value: targetName,
+                  placeholder: t('mergeTarget'),
+                  'aria-label': t('mergeTarget'),
+                  onChange: event => props.onTarget(event.target.value),
+                }))
+              : null
+
+          panel.push(h('div', { key: 'manage', className: 'dsh-ldb-souls-manage' },
+            h('div', { className: 'dsh-ldb-souls-manage-row' },
+              h('button', {
+                type: 'button', className: 'dsh-ldb-souls-action', disabled: !one, onClick: props.onCopy,
               }, t('copy')),
+              h('button', {
+                type: 'button', className: 'dsh-ldb-souls-action', disabled: !one, onClick: props.onRename,
+              }, t('rename')),
               h('button', {
                 type: 'button',
                 className: 'dsh-ldb-souls-action',
-                disabled: selected.length < 2 || !actionable,
+                disabled: !many || !actionable,
                 onClick: props.onMerge,
               }, t('merge')),
               h('button', {
-                type: 'button',
-                className: 'dsh-ldb-souls-action danger',
-                disabled: selected.length !== 1,
-                onClick: props.onAskDelete,
-              }, t('deleteSoul'))),
+                type: 'button', className: 'dsh-ldb-souls-action danger', disabled: !one, onClick: props.onAskDelete,
+              }, t('deleteSoul')),
+              h('span', { key: 'count', className: 'dsh-ldb-souls-muted' }, fill(t('selected'), selected.length))),
+            editor,
             confirm,
             actionStatus === undefined
               ? null
               : h('div', { key: 'status', className: 'dsh-ldb-souls-manage-status' }, actionStatus)))
         }
+
         children.push(h('div', { key: 'panel', className: 'dsh-ldb-souls-panel', role: 'region', 'aria-label': t('label') }, panel))
       }
 
@@ -539,6 +581,8 @@ window.__ModuleLoader__.load({
       const [targetName, setTargetName] = React.useState('')
       const [actionStatus, setActionStatus] = React.useState(undefined)
       const [confirmDelete, setConfirmDelete] = React.useState(undefined)
+      const [renaming, setRenaming] = React.useState(false)
+      const [renameValue, setRenameValue] = React.useState('')
 
       const load = React.useCallback(() => {
         if (sessionId === undefined) return
@@ -616,6 +660,8 @@ window.__ModuleLoader__.load({
         setTargetName('')
         setActionStatus(undefined)
         setConfirmDelete(undefined)
+        setRenaming(false)
+        setRenameValue('')
       }
 
       const selectSoul = name => {
@@ -638,7 +684,33 @@ window.__ModuleLoader__.load({
       const copySelected = () => {
         const from = selected[0]
         if (from === undefined) return
-        runAction(post(COPY_ROUTE, { from, to: targetName }), result => fill(translate('copied'), result.copied))
+        const to = nextCopyName(from, state.souls.map(soul => soul.name))
+        runAction(post(COPY_ROUTE, { from, to }), result => fill(translate('copied'), result.copied))
+      }
+
+      const startRename = () => {
+        if (selected.length !== 1) return
+        setRenaming(true)
+        setRenameValue(selected[0])
+        setActionStatus(undefined)
+        setConfirmDelete(undefined)
+      }
+
+      const cancelRename = () => {
+        setRenaming(false)
+        setRenameValue('')
+      }
+
+      const confirmRename = () => {
+        const from = selected[0]
+        const to = renameValue
+        if (from === undefined || to.length === 0) return
+        runAction(post(RENAME_ROUTE, { from, to }), () => {
+          setRenaming(false)
+          setRenameValue('')
+          if (preview.name === from) setPreview({ name: undefined, status: 'idle', notes: [], total: 0 })
+          return fill(translate('renamed'), to)
+        })
       }
 
       const mergeSelected = () => {
@@ -694,11 +766,18 @@ window.__ModuleLoader__.load({
         onAskDelete: () => { setConfirmDelete(selected[0]); setActionStatus(undefined) },
         onDeleteConfirmed: deleteSelected,
         onCancelDelete: () => setConfirmDelete(undefined),
+        renaming,
+        renameValue,
+        onRename: startRename,
+        onRenameValue: value => { setRenameValue(value); setActionStatus(undefined) },
+        onRenameConfirmed: confirmRename,
+        onCancelRename: cancelRename,
       })
     }
 
-    // The pure view is exposed for headless verification without a browser.
+    // Exposed for headless verification without a browser.
     SoulStrip.View = SoulStripView
+    SoulStrip.NextCopyName = nextCopyName
 
     return {
       inject: ['slots'],
@@ -719,8 +798,8 @@ window.__ModuleLoader__.load({
               noMatch: '没有匹配的 soul',
               more: '还有 {n} 个',
               notes: '{n} 条',
-              view: '查看',
-              hide: '收起',
+              view: 'view',
+              hide: 'hide',
               notesLoading: '读取中…',
               notesEmpty: '这个 soul 还没有内容',
               notesFailed: '读取失败',
@@ -739,8 +818,8 @@ window.__ModuleLoader__.load({
               noMatch: 'No matching soul',
               more: '+{n} more',
               notes: '{n} notes',
-              view: 'View',
-              hide: 'Hide',
+              view: 'view',
+              hide: 'hide',
               notesLoading: 'Loading…',
               notesEmpty: 'This soul has no notes yet',
               notesFailed: 'Could not load notes',
