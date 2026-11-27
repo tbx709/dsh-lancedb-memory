@@ -39,10 +39,11 @@ Embedded LanceDB memory for [DeepSeek Harness](https://github.com/deepseek-ai/de
 装好后刷新页面（客户端模块只在页面加载时装配），输入框下面会出现一行 `Souls`：
 
 - 折叠状态只显示当前会话已挂载的 soul 芯片，超过 8 个折成"还有 N 个"，soul 再多也不会撑高输入框。
-- 点"选择 (N)"展开挑选面板：soul 超过 6 个时带筛选框，列表最高 220px 可滚动，每行显示描述和条数，点一下挂载/卸载。
+- 点"选择 (N)"展开挑选面板：soul 超过 6 个时带筛选框，列表最高 320px 可滚动，每行显示描述和条数，点一下挂载/卸载。
+- 每行右侧的"查看"展开这个 soul 的记忆原文（最多 50 条，带 kind 和日期），不用叫 agent 就能核对内容；再点"收起"合上。
 - 已挂载的芯片点一下就卸载，效果等同 agent 调 `lancedb_attach`，下一次检索立刻生效。
 - 没有 soul 时显示提示，让 agent 先用 `lancedb_souls` 建一个。
-- 浏览器只走两个 owner-only 路由：`POST /api/lancedb/souls`（列表）和 `POST /api/lancedb/attach`（挂载/卸载），挂在已鉴权的 `/api` 通道上。
+- 浏览器只走三个 owner-only 路由：`POST /api/lancedb/souls`（列表）、`POST /api/lancedb/attach`（挂载/卸载）、`POST /api/lancedb/notes`（某个 soul 的条目），挂在已鉴权的 `/api` 通道上。
 
 ## 排序怎么算
 

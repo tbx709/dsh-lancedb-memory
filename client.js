@@ -3,10 +3,11 @@
  *
  * Renders one strip inside the composer dock. The collapsed row shows only the
  * souls attached to the current session plus a picker toggle, so a store with
- * dozens of souls never grows the composer. Expanding shows the full picker:
- * a filter box and a scrollable list with description and note count.
+ * dozens of souls never grows the composer. Expanding shows the picker: a
+ * filter box, a scrollable list, and per-soul note previews so the user can
+ * read what a soul actually remembers before using it.
  *
- * The strip talks to the host through two owner-only routes mounted on the
+ * The strip talks to the host through owner-only routes mounted on the
  * authenticated /api carrier; it owns no state beyond the current response.
  */
 
@@ -19,10 +20,13 @@ window.__ModuleLoader__.load({
     const NS = 'dsh-lancedb-memory'
     const SOULS_ROUTE = '/api/lancedb/souls'
     const ATTACH_ROUTE = '/api/lancedb/attach'
+    const NOTES_ROUTE = '/api/lancedb/notes'
     /** Attached chips beyond this collapse into a "+N" marker. */
     const MAX_ATTACHED_CHIPS = 8
     /** The filter box only appears once the list is worth filtering. */
     const FILTER_THRESHOLD = 6
+    /** Notes fetched per preview. */
+    const NOTES_LIMIT = 50
 
     const FALLBACK = {
       label: 'Souls',
@@ -37,6 +41,12 @@ window.__ModuleLoader__.load({
       noMatch: '没有匹配的 soul',
       more: '还有 {n} 个',
       notes: '{n} 条',
+      view: '查看',
+      hide: '收起',
+      notesLoading: '读取中…',
+      notesEmpty: '这个 soul 还没有内容',
+      notesFailed: '读取失败',
+      showing: '只显示前 {n} 条',
     }
 
     const CSS = `
@@ -112,28 +122,34 @@ window.__ModuleLoader__.load({
   font: inherit;
 }
 .dsh-ldb-souls-filter:focus { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 0; }
-.dsh-ldb-souls-list { display: flex; flex-direction: column; gap: 2px; max-height: 220px; overflow-y: auto; }
+.dsh-ldb-souls-list { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow-y: auto; }
 .dsh-ldb-souls-item {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
   padding: 5px 8px;
   border: 1px solid transparent;
   border-radius: 8px;
+}
+.dsh-ldb-souls-item:hover { background: var(--dsw-alias-bg-layer-2); }
+.dsh-ldb-souls-item-row { display: flex; align-items: center; gap: 8px; }
+.dsh-ldb-souls-item-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
   background: transparent;
   color: inherit;
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
-.dsh-ldb-souls-item:hover { background: var(--dsw-alias-bg-layer-2); }
-.dsh-ldb-souls-item:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 0; }
-.dsh-ldb-souls-item[aria-pressed="true"] {
-  border-color: var(--dsw-alias-brand-primary);
-  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);
-  color: var(--dsw-alias-brand-primary);
-}
-.dsh-ldb-souls-item:disabled { opacity: .6; cursor: progress; }
+.dsh-ldb-souls-item-main:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 0; }
+.dsh-ldb-souls-item-main[aria-pressed="true"] { color: var(--dsw-alias-brand-primary); }
+.dsh-ldb-souls-item-main:disabled { opacity: .6; cursor: progress; }
 .dsh-ldb-souls-item-head { display: flex; align-items: baseline; gap: 6px; }
 .dsh-ldb-souls-item-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dsh-ldb-souls-item-desc {
@@ -142,6 +158,31 @@ window.__ModuleLoader__.load({
   white-space: nowrap;
   opacity: .75;
 }
+.dsh-ldb-souls-item-preview {
+  flex: none;
+  padding: 2px 7px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.dsh-ldb-souls-item-preview:hover { border-color: var(--dsw-alias-border-l2); color: var(--dsw-alias-label-primary); }
+.dsh-ldb-souls-item-preview[aria-expanded="true"] { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); }
+.dsh-ldb-souls-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 2px 0 6px 2px;
+  padding-left: 8px;
+  border-left: 2px solid var(--dsw-alias-border-l1);
+}
+.dsh-ldb-souls-note { display: flex; flex-direction: column; gap: 2px; }
+.dsh-ldb-souls-note-meta { display: flex; gap: 8px; opacity: .7; }
+.dsh-ldb-souls-note-kind { font-weight: 500; }
+.dsh-ldb-souls-note-text { white-space: pre-wrap; word-break: break-word; }
 `
 
     /**
@@ -173,12 +214,49 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Pure presentation: attached chips plus the optional picker panel.
-     * @param {object} props - Souls, attachment state, and callbacks.
+     * Readable date for a stored timestamp.
+     * @param {unknown} value - Epoch milliseconds.
+     * @returns Local date text, or empty for a bad value.
+     */
+    function dateText(value) {
+      const time = Number(value)
+      return Number.isFinite(time) && time > 0 ? new Date(time).toLocaleDateString() : ''
+    }
+
+    /**
+     * One soul's notes inside the picker.
+     * @param {{ status: string, notes: Array, total: number, error?: string }} preview - Preview state.
+     * @param {Function} t - Bound copy.
+     * @returns React element.
+     */
+    function NotePreview(preview, t) {
+      if (preview.status === 'loading') {
+        return h('div', { className: 'dsh-ldb-souls-muted' }, t('notesLoading'))
+      }
+      if (preview.status === 'error') {
+        return h('div', { className: 'dsh-ldb-souls-error' }, preview.error ?? t('notesFailed'))
+      }
+      if (preview.notes.length === 0) {
+        return h('div', { className: 'dsh-ldb-souls-muted' }, t('notesEmpty'))
+      }
+      return h('div', { className: 'dsh-ldb-souls-notes' },
+        preview.notes.map(note => h('article', { key: note.id, className: 'dsh-ldb-souls-note' },
+          h('div', { className: 'dsh-ldb-souls-note-meta' },
+            h('span', { className: 'dsh-ldb-souls-note-kind' }, note.kind),
+            h('time', null, dateText(note.createdAt))),
+          h('div', { className: 'dsh-ldb-souls-note-text' }, note.text))),
+        preview.total > preview.notes.length
+          ? h('div', { className: 'dsh-ldb-souls-muted' }, fill(t('showing'), preview.notes.length))
+          : null)
+    }
+
+    /**
+     * Pure presentation: attached chips, the picker panel, and note previews.
+     * @param {object} props - Souls, attachment state, preview state, callbacks.
      * @returns React element.
      */
     function SoulStripView(props) {
-      const { souls, attached, status, error, expanded, query, pending, t } = props
+      const { souls, attached, status, error, expanded, query, pending, preview, t } = props
       const attachedSouls = souls.filter(soul => attached.includes(soul.name))
       const shown = attachedSouls.slice(0, MAX_ATTACHED_CHIPS)
       const hidden = attachedSouls.length - shown.length
@@ -186,6 +264,7 @@ window.__ModuleLoader__.load({
       const matches = needle.length === 0
         ? souls
         : souls.filter(soul => `${soul.name} ${soul.description ?? ''}`.toLowerCase().includes(needle))
+      const openName = preview.name
 
       const row = [
         h('span', { key: 'label', className: 'dsh-ldb-souls-label' }, t('label')),
@@ -210,9 +289,7 @@ window.__ModuleLoader__.load({
             title: soul.description === undefined || soul.description.length === 0 ? soul.name : soul.description,
             disabled: pending === soul.name,
             onClick: () => props.onToggle(soul.name, false),
-          },
-          h('span', { className: 'dsh-ldb-souls-name' }, soul.name),
-          h('span', { className: 'dsh-ldb-souls-count' }, String(soul.notes ?? 0))))
+          }, h('span', { className: 'dsh-ldb-souls-name' }, soul.name)))
         }
         if (hidden > 0) {
           row.push(h('span', { key: 'more', className: 'dsh-ldb-souls-muted' }, fill(t('more'), hidden)))
@@ -251,19 +328,28 @@ window.__ModuleLoader__.load({
         }
         const items = matches.map(soul => {
           const isAttached = attached.includes(soul.name)
-          return h('button', {
-            key: soul.name,
-            type: 'button',
-            className: 'dsh-ldb-souls-item',
-            'aria-pressed': isAttached,
-            disabled: pending === soul.name,
-            onClick: () => props.onToggle(soul.name, !isAttached),
-          },
-          h('span', { className: 'dsh-ldb-souls-item-head' },
-            h('span', { className: 'dsh-ldb-souls-item-name' }, soul.name),
-            h('span', { className: 'dsh-ldb-souls-count' }, fill(t('notes'), soul.notes ?? 0))),
-          h('span', { className: 'dsh-ldb-souls-item-desc' },
-            soul.description === undefined || soul.description.length === 0 ? '\u00a0' : soul.description))
+          const isOpen = openName === soul.name
+          const description = soul.description === undefined || soul.description.length === 0 ? '\u00a0' : soul.description
+          return h('div', { key: soul.name, className: 'dsh-ldb-souls-item' },
+            h('div', { className: 'dsh-ldb-souls-item-row' },
+              h('button', {
+                type: 'button',
+                className: 'dsh-ldb-souls-item-main',
+                'aria-pressed': isAttached,
+                disabled: pending === soul.name,
+                onClick: () => props.onToggle(soul.name, !isAttached),
+              },
+              h('span', { className: 'dsh-ldb-souls-item-head' },
+                h('span', { className: 'dsh-ldb-souls-item-name' }, soul.name),
+                h('span', { className: 'dsh-ldb-souls-count' }, fill(t('notes'), soul.notes ?? 0))),
+              h('span', { className: 'dsh-ldb-souls-item-desc' }, description)),
+              h('button', {
+                type: 'button',
+                className: 'dsh-ldb-souls-item-preview',
+                'aria-expanded': isOpen,
+                onClick: () => props.onNotes(soul.name),
+              }, isOpen ? t('hide') : t('view'))),
+            isOpen ? NotePreview(preview, t) : null)
         })
         panel.push(h('div', { key: 'list', className: 'dsh-ldb-souls-list' },
           matches.length === 0
@@ -276,7 +362,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Stateful strip: fetch the catalog, toggle attachments, own the panel.
+     * Stateful strip: fetch the catalog, toggle attachments, preview notes.
      * @param {object} props - Slot props; `sessionId` identifies the session.
      * @returns React element or null without a session.
      */
@@ -287,6 +373,7 @@ window.__ModuleLoader__.load({
       const [pending, setPending] = React.useState(undefined)
       const [expanded, setExpanded] = React.useState(false)
       const [query, setQuery] = React.useState('')
+      const [preview, setPreview] = React.useState({ name: undefined, status: 'idle', notes: [], total: 0 })
 
       const load = React.useCallback(() => {
         if (sessionId === undefined) return
@@ -308,6 +395,22 @@ window.__ModuleLoader__.load({
         ).finally(() => setPending(undefined))
       }
 
+      const showNotes = name => {
+        if (preview.name === name) {
+          setPreview({ name: undefined, status: 'idle', notes: [], total: 0 })
+          return
+        }
+        setPreview({ name, status: 'loading', notes: [], total: 0 })
+        post(NOTES_ROUTE, { soul: name, limit: NOTES_LIMIT }).then(
+          data => setPreview(previous => previous.name === name
+            ? { name, status: 'ready', notes: data.memories ?? [], total: data.total ?? 0 }
+            : previous),
+          error => setPreview(previous => previous.name === name
+            ? { name, status: 'error', notes: [], total: 0, error: error.message }
+            : previous),
+        )
+      }
+
       if (sessionId === undefined) return null
 
       return h(SoulStripView, {
@@ -318,11 +421,13 @@ window.__ModuleLoader__.load({
         expanded,
         query,
         pending,
+        preview,
         t: translate,
         onRetry: load,
         onExpand: () => setExpanded(value => !value),
         onQuery: setQuery,
         onToggle: toggle,
+        onNotes: showNotes,
       })
     }
 
@@ -348,6 +453,12 @@ window.__ModuleLoader__.load({
               noMatch: '没有匹配的 soul',
               more: '还有 {n} 个',
               notes: '{n} 条',
+              view: '查看',
+              hide: '收起',
+              notesLoading: '读取中…',
+              notesEmpty: '这个 soul 还没有内容',
+              notesFailed: '读取失败',
+              showing: '只显示前 {n} 条',
             },
             en: {
               label: 'Souls',
@@ -362,6 +473,12 @@ window.__ModuleLoader__.load({
               noMatch: 'No matching soul',
               more: '+{n} more',
               notes: '{n} notes',
+              view: 'View',
+              hide: 'Hide',
+              notesLoading: 'Loading…',
+              notesEmpty: 'This soul has no notes yet',
+              notesFailed: 'Could not load notes',
+              showing: 'Showing the first {n}',
             },
           }
           try {

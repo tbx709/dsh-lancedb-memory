@@ -1423,6 +1423,21 @@ export function apply(ctx, config) {
         }
       },
     }))
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/lancedb/notes',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const body = await request.json().catch(() => ({}))
+          const name = normalizeSoulName(body.soul)
+          const limit = Number.isInteger(body.limit) ? Math.min(Math.max(body.limit, 1), 100) : 50
+          return Response.json(await store.list(soulScope(name), { limit }))
+        } catch (error) {
+          return Response.json({ error: errorMessage(error) }, { status: 400 })
+        }
+      },
+    }))
   })
 
   const tools = [

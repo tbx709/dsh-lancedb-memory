@@ -172,8 +172,10 @@ try {
   // --- Browser routes behind the authenticated /api carrier ---------------
   const soulsRoute = plugin.routes.get('/api/lancedb/souls')
   const attachRoute = plugin.routes.get('/api/lancedb/attach')
+  const notesRoute = plugin.routes.get('/api/lancedb/notes')
   assert.ok(soulsRoute, 'souls route is registered')
   assert.ok(attachRoute, 'attach route is registered')
+  assert.ok(notesRoute, 'notes route is registered')
 
   const routePost = (route, body) => route.fetch(new Request('http://host/api/lancedb', {
     method: 'POST',
@@ -199,6 +201,11 @@ try {
   assert.equal(missingSession.status, 400)
   const unknownSoul = await routePost(attachRoute, { sessionId: 'ui', souls: ['nope'] })
   assert.equal(unknownSoul.status, 400)
+  const emptyNotes = await routePost(notesRoute, { soul: 'writing' })
+  assert.equal(emptyNotes.status, 200)
+  assert.equal((await emptyNotes.json()).memories.length, 0)
+  const badNotes = await routePost(notesRoute, { soul: 'Bad Name' })
+  assert.equal(badNotes.status, 400)
 
   // --- Promote from a session into a soul ---------------------------------
   const draft = await call(plugin.tools, 'lancedb_store', {
@@ -218,6 +225,10 @@ try {
   const again = await call(plugin.tools, 'lancedb_promote', { ids: [draft.id], soul: 'writing' }, 'a')
   assert.equal(again.copied.length, 0)
   assert.equal(again.skipped[0].reason, 'already-in-soul')
+
+  const previewNotes = await (await routePost(plugin.routes.get('/api/lancedb/notes'), { soul: 'writing' })).json()
+  assert.equal(previewNotes.memories.length, 1)
+  assert.match(previewNotes.memories[0].text, /文案标题/u)
 
   const foreign = await call(plugin.tools, 'lancedb_promote', { ids: [own.id], soul: 'writing' }, 'a')
   assert.equal(foreign.skipped[0].reason, 'not-in-session', 'cannot promote another session note')
