@@ -75,6 +75,9 @@ window.__ModuleLoader__.load({
       mergedFallback: '模型不可用，按文本合并了 {n} 条',
       merging: '合并中…（模型在整理）',
       close: '关闭',
+      use: 'use',
+      using: 'using',
+      hint: '点 use 挂到这个会话，再点一次取消',
       soulDeleted: '已删除，连带 {n} 条记忆',
     }
 
@@ -296,6 +299,28 @@ window.__ModuleLoader__.load({
   padding: 12px 14px 8px;
 }
 .dsh-ldb-souls-dialog-body { padding: 0 14px 14px; max-height: 60vh; overflow: auto; }
+.dsh-ldb-souls-item[data-attached="true"] {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 7%, transparent);
+}
+.dsh-ldb-souls-item-use {
+  flex: none;
+  padding: 2px 9px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.dsh-ldb-souls-item-use:hover { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); }
+.dsh-ldb-souls-item-use[aria-pressed="true"] {
+  border-color: var(--dsw-alias-brand-primary);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent);
+  color: var(--dsw-alias-brand-primary);
+}
+.dsh-ldb-souls-item-use:disabled { opacity: .5; cursor: progress; }
+.dsh-ldb-souls-hint { opacity: .75; padding: 0 2px 2px; }
 .dsh-ldb-souls-modal { padding: 0; }
 .dsh-ldb-souls-modal .dsh-ldb-souls-panel { border: 0; padding: 0; background: transparent; }
 `
@@ -418,7 +443,8 @@ window.__ModuleLoader__.load({
       const hidden = attachedSouls.length - shown.length
       const needle = query.trim().toLowerCase()
       const matches = needle.length === 0
-        ? souls
+        ? [...souls].sort((left, right) =>
+          Number(attached.includes(right.name)) - Number(attached.includes(left.name)))
         : souls.filter(soul => `${soul.name} ${soul.description ?? ''}`.toLowerCase().includes(needle))
       const openName = preview.name
 
@@ -492,11 +518,16 @@ window.__ModuleLoader__.load({
             },
           }))
         }
+        if (modal) panel.push(h('div', { key: 'hint', className: 'dsh-ldb-souls-hint' }, t('hint')))
         const items = matches.map(soul => {
           const isAttached = attached.includes(soul.name)
           const isOpen = openName === soul.name
           const description = soul.description === undefined || soul.description.length === 0 ? '\u00a0' : soul.description
-          return h('div', { key: soul.name, className: 'dsh-ldb-souls-item' },
+          return h('div', {
+            key: soul.name,
+            className: 'dsh-ldb-souls-item',
+            'data-attached': isAttached ? 'true' : 'false',
+          },
             h('div', { className: 'dsh-ldb-souls-item-row' },
               managing
                 ? h('input', {
@@ -518,6 +549,13 @@ window.__ModuleLoader__.load({
                 h('span', { className: 'dsh-ldb-souls-item-name' }, soul.name),
                 h('span', { className: 'dsh-ldb-souls-count' }, fill(t('notes'), soul.notes ?? 0))),
               h('span', { className: 'dsh-ldb-souls-item-desc' }, description)),
+              h('button', {
+                type: 'button',
+                className: 'dsh-ldb-souls-item-use',
+                'aria-pressed': isAttached,
+                disabled: pending !== undefined,
+                onClick: () => props.onToggle(soul.name, !isAttached),
+              }, isAttached ? t('using') : t('use')),
               h('button', {
                 type: 'button',
                 className: 'dsh-ldb-souls-item-preview',
@@ -1057,6 +1095,9 @@ window.__ModuleLoader__.load({
               mergedFallback: '模型不可用，按文本合并了 {n} 条',
               merging: '合并中…（模型在整理）',
               close: '关闭',
+              use: 'use',
+              using: 'using',
+              hint: '点 use 挂到这个会话，再点一次取消',
               soulDeleted: '已删除，连带 {n} 条记忆',
               selected: '已选 {n}',
               confirm: '确认',
@@ -1098,6 +1139,9 @@ window.__ModuleLoader__.load({
               mergedFallback: 'Model unavailable; merged {n} notes by text',
               merging: 'Merging… (the model is consolidating)',
               close: 'Close',
+              use: 'use',
+              using: 'using',
+              hint: 'Click use to attach this soul to the current session; click again to detach.',
               soulDeleted: 'Deleted with {n} notes',
               selected: '{n} selected',
               confirm: 'Confirm',
