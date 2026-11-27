@@ -183,6 +183,10 @@ try {
     call(plugin.tools, 'lancedb_search', { query: 'x', souls: ['missing'] }),
     /不存在/u,
   )
+  await assert.rejects(
+    call(plugin.tools, 'lancedb_list', { soul: 'missing' }),
+    /不存在/u,
+  )
 
   const copyRace = await Promise.allSettled([
     souls({ action: 'copy', name: 'beta', target: 'beta-copy' }),
@@ -199,6 +203,12 @@ try {
   ])
   const raceRows = await call(plugin.tools, 'lancedb_list', { soul: 'race-target' })
   assert.equal(new Set(raceRows.memories.map(row => row.id)).size, raceRows.memories.length, 'no duplicate ids from a merge race')
+
+  await assert.rejects(souls({ action: 'explode' }), /action 只能是/u)
+  const stringFlag = await souls({
+    action: 'merge', sources: ['beta'], target: 'flag-target', semantic: 'false',
+  })
+  assert.equal(stringFlag.semantic, false, 'non-true semantic flags stay mechanical')
 
   // --- Semantic fallbacks --------------------------------------------------
   const brokenDirectory = join(root, 'broken')

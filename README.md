@@ -32,7 +32,7 @@ Embedded LanceDB memory for [DeepSeek Harness](https://github.com/deepseek-ai/de
 | `lancedb_forget` | 删会话里的记忆；删 soul 里的要显式传 `soul` |
 | `lancedb_stats` | 目录、行数、kind 分布、会话数、各 soul 数量、检索模式 |
 
-同时注册 Host 服务 `lancedb`，方法都显式收 scope：`store(scope, input)`、`search(scopes, input)`、`promote(sessionScope, input)` 等。
+同时注册 Host 服务 `lancedb`，方法显式收 scope：`store(scope, input)`、`search(scopes, input)`、`promote(sessionScope, input)`；soul 级操作有 `createSoul` / `copySoul` / `renameSoul` / `mergeSouls` / `deleteSoul`。
 
 ## Web 界面
 

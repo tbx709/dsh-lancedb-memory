@@ -311,10 +311,16 @@ window.__ModuleLoader__.load({
       if (preview.status === 'error') {
         return h('div', { className: 'dsh-ldb-souls-error' }, preview.error ?? t('notesFailed'))
       }
-      if (preview.notes.length === 0) {
-        return h('div', { className: 'dsh-ldb-souls-muted' }, t('notesEmpty'))
-      }
       const undoable = ui.lastDeleted !== undefined && ui.lastDeleted.soul === preview.name
+      if (preview.notes.length === 0) {
+        return h('div', { className: 'dsh-ldb-souls-notes' },
+          h('div', { className: 'dsh-ldb-souls-muted' }, t('notesEmpty')),
+          undoable
+            ? h('div', { className: 'dsh-ldb-souls-undo' },
+              h('span', null, t('deleted')),
+              h('button', { type: 'button', className: 'dsh-ldb-souls-link', onClick: ui.onUndo }, t('undo')))
+            : null)
+      }
       return h('div', { className: 'dsh-ldb-souls-notes' },
         preview.notes.map(note => h('article', { key: note.id, className: 'dsh-ldb-souls-note' },
           h('div', { className: 'dsh-ldb-souls-note-head' },
@@ -584,26 +590,66 @@ window.__ModuleLoader__.load({
       const [renaming, setRenaming] = React.useState(false)
       const [renameValue, setRenameValue] = React.useState('')
       const [acting, setActing] = React.useState(false)
+      const loadSeq = React.useRef(0)
+      const sessionRef = React.useRef(sessionId)
+      sessionRef.current = sessionId
 
       const load = React.useCallback(() => {
         if (sessionId === undefined) return
+        const seq = ++loadSeq.current
         setState(previous => previous.status === 'ready'
           ? { ...previous, error: undefined }
           : { ...previous, status: 'loading', error: undefined })
         post(SOULS_ROUTE, { sessionId }).then(
-          data => setState({ status: 'ready', souls: data.souls ?? [], attached: data.attached ?? [], error: undefined }),
-          error => setState(previous => ({ ...previous, status: 'error', error: error.message })),
+          data => {
+            if (seq !== loadSeq.current) return
+            const souls = data.souls ?? []
+            setState({ status: 'ready', souls, attached: data.attached ?? [], error: undefined })
+            // A soul deleted elsewhere must not stay selected for the next action.
+            setSelected(previous => previous.filter(name => souls.some(soul => soul.name === name)))
+            setConfirmDelete(previous => previous !== undefined && souls.some(soul => soul.name === previous)
+              ? previous
+              : undefined)
+            setPreview(previous => previous.name !== undefined && !souls.some(soul => soul.name === previous.name)
+              ? { name: undefined, status: 'idle', notes: [], total: 0 }
+              : previous)
+          },
+          error => {
+            if (seq !== loadSeq.current) return
+            setState(previous => ({ ...previous, status: 'error', error: error.message }))
+          },
         )
       }, [sessionId])
 
       React.useEffect(() => { load() }, [load])
 
+      React.useEffect(() => {
+        setPreview({ name: undefined, status: 'idle', notes: [], total: 0 })
+        setLastDeleted(undefined)
+        setSelected([])
+        setManaging(false)
+        setConfirmDelete(undefined)
+        setRenaming(false)
+        setRenameValue('')
+        setQuery('')
+        setPending(undefined)
+        setTargetName('')
+        setActionStatus(undefined)
+        setActing(false)
+      }, [sessionId])
+
       const toggle = (name, wantAttached) => {
         if (pending !== undefined || sessionId === undefined) return
         setPending(name)
         post(ATTACH_ROUTE, { sessionId, souls: [name], detach: !wantAttached }).then(
-          data => setState(previous => ({ ...previous, attached: data.attached ?? [], error: undefined })),
-          error => setState(previous => ({ ...previous, error: error.message })),
+          data => {
+            if (sessionRef.current !== sessionId) return
+            setState(previous => ({ ...previous, attached: data.attached ?? [], error: undefined }))
+          },
+          error => {
+            if (sessionRef.current !== sessionId) return
+            setState(previous => ({ ...previous, error: error.message }))
+          },
         ).finally(() => setPending(undefined))
       }
 
@@ -786,7 +832,12 @@ window.__ModuleLoader__.load({
         onTarget: value => { setTargetName(value); setActionStatus(undefined) },
         onCopy: copySelected,
         onMerge: mergeSelected,
-        onAskDelete: () => { setConfirmDelete(selected[0]); setActionStatus(undefined) },
+        onAskDelete: () => {
+          setConfirmDelete(selected[0])
+          setActionStatus(undefined)
+          setRenaming(false)
+          setRenameValue('')
+        },
         onDeleteConfirmed: deleteSelected,
         onCancelDelete: () => setConfirmDelete(undefined),
         renaming,

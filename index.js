@@ -743,7 +743,8 @@ class MemoryStore {
       await this.#writeSoul(target, { description })
     }
     const targetScope = soulScope(target)
-    const useSemantic = input.semantic !== false && typeof this.#complete === 'function'
+    const wantedSemantic = input.semantic === undefined || input.semantic === true
+    const useSemantic = wantedSemantic && typeof this.#complete === 'function'
 
     const gathered = await this.#collectMergeCandidates(sources, targetScope)
     let plans
@@ -760,6 +761,15 @@ class MemoryStore {
       let copied = 0
       let skipped = gathered.skipped
       let mergedGroups = 0
+      const currentSouls = await this.#souls()
+      for (const name of sources) {
+        if (currentSouls[name] === undefined) {
+          throw new Error(`dsh-lancedb-memory: soul "${name}" 在合并过程中被删除了`)
+        }
+      }
+      if (currentSouls[target] === undefined) {
+        throw new Error(`dsh-lancedb-memory: 目标 soul "${target}" 在合并过程中被删除了`)
+      }
       const table = gathered.table === undefined ? undefined : await this.#table()
       if (table !== undefined) {
         const now = Date.now()
@@ -1035,6 +1045,7 @@ class MemoryStore {
     const createdAt = Date.now()
 
     return this.#serial(async () => {
+      if (soul !== undefined) await this.#requireSoul(soul)
       const vector = await this.#embedder.embed(text)
       this.#embedder.dimension = vector.length
       const table = await this.#table()
@@ -1175,6 +1186,7 @@ class MemoryStore {
     const move = input.move === true
 
     return this.#serial(async () => {
+      await this.#requireSoul(soul)
       const table = await this.#table()
       if (table === undefined) throw new Error('dsh-lancedb-memory: 记忆库还是空的，没有可 promote 的内容')
       await this.#prepare(table)
@@ -1327,7 +1339,7 @@ class MemoryStore {
    * @returns Stats payload.
    */
   async stats(sessionScopeValue) {
-    const table = await this.#table()
+    let table = await this.#table()
     if (table === undefined) {
       return {
         ...this.describe(), exists: false, rows: 0, kinds: [],
@@ -1338,13 +1350,24 @@ class MemoryStore {
     let purged = 0
     if (this.#settings.sessionTtlDays > 0 && sessionScopeValue !== undefined) {
       const cutoff = Date.now() - this.#settings.sessionTtlDays * DAY_MS
-      try {
-        const stale = `scope LIKE '${SESSION_PREFIX}%' AND lastAccessedAt < ${cutoff} AND scope != '${escapeSql(sessionScopeValue)}'`
-        const before = await table.countRows(stale)
-        if (before > 0) await table.delete(stale)
-        purged = before
-      } catch {
-        purged = -1
+      const stale = `scope LIKE '${SESSION_PREFIX}%' AND lastAccessedAt < ${cutoff} AND scope != '${escapeSql(sessionScopeValue)}'`
+      purged = await this.#serial(async () => {
+        try {
+          const fresh = await this.#table()
+          if (fresh === undefined) return 0
+          const before = await fresh.countRows(stale)
+          if (before > 0) await fresh.delete(stale)
+          return before
+        } catch {
+          return -1
+        }
+      })
+      table = await this.#table()
+      if (table === undefined) {
+        return {
+          ...this.describe(), exists: false, rows: 0, kinds: [],
+          scopes: { session: 0, sessions: 0, souls: [] },
+        }
       }
     }
 
@@ -1376,6 +1399,7 @@ class MemoryStore {
       },
       ...purged === 0 ? {} : { purgedSessions: purged },
       search: this.#settings.search,
+      merge: this.#settings.merge,
     }
   }
 
@@ -1899,6 +1923,9 @@ export function apply(ctx, config) {
     forget: (sessionScopeValue, input) => store.forget(sessionScopeValue, input),
     souls: sessionScopeValue => store.soulCatalog(sessionScopeValue),
     createSoul: input => store.createSoul(input),
+    copySoul: input => store.copySoul(input),
+    renameSoul: input => store.renameSoul(input),
+    mergeSouls: input => store.mergeSouls(input),
     deleteSoul: input => store.deleteSoul(input),
     attach: (sessionScopeValue, input) => store.attach(sessionScopeValue, input),
     stats: sessionScopeValue => store.stats(sessionScopeValue),
@@ -2153,6 +2180,10 @@ export function apply(ctx, config) {
         additionalProperties: false,
       },
       execute: async (input, exec) => {
+        const actions = ['list', 'create', 'copy', 'rename', 'merge', 'delete']
+        if (!actions.includes(input.action)) {
+          throw new Error(`dsh-lancedb-memory: action 只能是 ${actions.join(' / ')}，收到 ${JSON.stringify(input.action)}`)
+        }
         if (input.action === 'list') return store.soulCatalog(scopeOfExecution(exec))
         if (input.action === 'copy') {
           return store.copySoul({ from: input.name, to: input.target, description: input.description })
@@ -2198,10 +2229,12 @@ export function apply(ctx, config) {
         },
         additionalProperties: false,
       },
-      execute: (input, exec) => store.list(
-        input.soul === undefined ? scopeOfExecution(exec) : soulScope(normalizeSoulName(input.soul)),
-        input,
-      ),
+      execute: async (input, exec) => {
+        if (input.soul === undefined) return store.list(scopeOfExecution(exec), input)
+        const name = normalizeSoulName(input.soul)
+        await store.requireSouls([name])
+        return store.list(soulScope(name), input)
+      },
     }),
     tool({
       name: 'lancedb_forget',

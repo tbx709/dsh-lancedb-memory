@@ -1,6 +1,6 @@
 {
   "name": "dsh-lancedb-memory",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "private": true,
   "type": "module",
   "description": "Embedded LanceDB memory for DSH: session-isolated storage, reusable souls, hybrid vector+BM25 recall",
