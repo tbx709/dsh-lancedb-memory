@@ -140,8 +140,11 @@ pnpm install     # 拉 @lancedb/lancedb@0.41.x，原生包约 205 MB，不进仓
 ## 自测
 
 ```bash
-node test/smoke.mjs    # 会话隔离、soul 增删挂载、promote、语义合并、排序、迁移、HTTP 嵌入
-node test/edges.mjs    # 校验错误、复制/合并竞态、维度不匹配、TTL 清理、路由参数校验
+node test/smoke.mjs        # 会话隔离、soul 增删挂载、promote、语义合并、排序、迁移、HTTP 嵌入
+node test/edges.mjs        # 校验错误、复制/合并竞态、维度不匹配、TTL 清理、路由参数校验
+node test/fuzz.mjs         # 120 步随机操作，检查 id 唯一、统计一致、无孤儿 scope
+node test/concurrency.mjs  # 并发 store/promote/copy/rename/merge/delete 的竞态
+npm run test:all           # 以上全部
 ```
 
 ## 设计来源

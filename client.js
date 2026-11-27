@@ -438,7 +438,10 @@ window.__ModuleLoader__.load({
             placeholder: t('filter'),
             'aria-label': t('filter'),
             onChange: event => props.onQuery(event.target.value),
-            onKeyDown: event => { if (event.key === 'Escape') props.onExpand() },
+            onKeyDown: event => {
+              if (event.key === 'Escape') props.onExpand()
+              if (event.key === 'Enter') event.stopPropagation()
+            },
           }))
         }
         const items = matches.map(soul => {
@@ -533,6 +536,7 @@ window.__ModuleLoader__.load({
                   placeholder: t('mergeTarget'),
                   'aria-label': t('mergeTarget'),
                   onChange: event => props.onTarget(event.target.value),
+                  onKeyDown: event => { if (event.key === 'Enter') event.stopPropagation() },
                 }))
               : null
 
@@ -593,6 +597,14 @@ window.__ModuleLoader__.load({
       const loadSeq = React.useRef(0)
       const sessionRef = React.useRef(sessionId)
       sessionRef.current = sessionId
+      const pendingRef = React.useRef(false)
+      const deletingRef = React.useRef(false)
+      const actingRef = React.useRef(false)
+      const undoingRef = React.useRef(false)
+      const pendingToken = React.useRef(0)
+      const deletingToken = React.useRef(0)
+      const actingToken = React.useRef(0)
+      const undoingToken = React.useRef(0)
 
       const load = React.useCallback(() => {
         if (sessionId === undefined) return
@@ -624,6 +636,7 @@ window.__ModuleLoader__.load({
       React.useEffect(() => { load() }, [load])
 
       React.useEffect(() => {
+        setState({ status: 'loading', souls: [], attached: [], error: undefined })
         setPreview({ name: undefined, status: 'idle', notes: [], total: 0 })
         setLastDeleted(undefined)
         setSelected([])
@@ -636,10 +649,20 @@ window.__ModuleLoader__.load({
         setTargetName('')
         setActionStatus(undefined)
         setActing(false)
+        pendingRef.current = false
+        deletingRef.current = false
+        actingRef.current = false
+        undoingRef.current = false
+        pendingToken.current += 1
+        deletingToken.current += 1
+        actingToken.current += 1
+        undoingToken.current += 1
       }, [sessionId])
 
       const toggle = (name, wantAttached) => {
-        if (pending !== undefined || sessionId === undefined) return
+        if (pendingRef.current || sessionId === undefined) return
+        pendingRef.current = true
+        const token = ++pendingToken.current
         setPending(name)
         post(ATTACH_ROUTE, { sessionId, souls: [name], detach: !wantAttached }).then(
           data => {
@@ -650,7 +673,11 @@ window.__ModuleLoader__.load({
             if (sessionRef.current !== sessionId) return
             setState(previous => ({ ...previous, error: error.message }))
           },
-        ).finally(() => setPending(undefined))
+        ).finally(() => {
+          if (pendingToken.current !== token) return
+          pendingRef.current = false
+          setPending(undefined)
+        })
       }
 
       const loadNotes = React.useCallback(name => {
@@ -676,7 +703,9 @@ window.__ModuleLoader__.load({
 
       const deleteNote = note => {
         const soul = preview.name
-        if (deleting !== undefined || soul === undefined) return
+        if (deletingRef.current || soul === undefined) return
+        deletingRef.current = true
+        const token = ++deletingToken.current
         setDeleting(note.id)
         post(DELETE_ROUTE, { soul, id: note.id }).then(result => {
           if (result.deleted !== true) throw new Error('这条已经不在了')
@@ -685,11 +714,17 @@ window.__ModuleLoader__.load({
             : previous)
           setLastDeleted({ soul, note })
         }).catch(error => setState(previous => ({ ...previous, error: error.message })))
-          .finally(() => setDeleting(undefined))
+          .finally(() => {
+            if (deletingToken.current !== token) return
+            deletingRef.current = false
+            setDeleting(undefined)
+          })
       }
 
       const undoDelete = () => {
-        if (lastDeleted === undefined) return
+        if (undoingRef.current || lastDeleted === undefined) return
+        undoingRef.current = true
+        const token = ++undoingToken.current
         const { soul, note } = lastDeleted
         post(RESTORE_ROUTE, {
           soul,
@@ -701,6 +736,10 @@ window.__ModuleLoader__.load({
           setLastDeleted(undefined)
           loadNotes(soul)
         }).catch(error => setState(previous => ({ ...previous, error: error.message })))
+          .finally(() => {
+            if (undoingToken.current !== token) return
+            undoingRef.current = false
+          })
       }
 
       const toggleManage = () => {
@@ -724,15 +763,25 @@ window.__ModuleLoader__.load({
       }
 
       const runAction = (request, describe, pending) => {
-        if (acting) return
+        if (actingRef.current) return
+        actingRef.current = true
+        const token = ++actingToken.current
+        const session = sessionRef.current
         setActing(true)
         setActionStatus(pending)
         request.then(result => {
+          if (sessionRef.current !== session) return
           setActionStatus(describe(result))
           setSelected([])
           load()
-        }).catch(error => setActionStatus(error.message))
-          .finally(() => setActing(false))
+        }).catch(error => {
+          if (sessionRef.current !== session) return
+          setActionStatus(error.message)
+        }).finally(() => {
+          if (actingToken.current !== token) return
+          actingRef.current = false
+          setActing(false)
+        })
       }
 
       const copySelected = () => {

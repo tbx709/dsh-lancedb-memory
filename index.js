@@ -1875,7 +1875,7 @@ function jsonContent(value) {
 
 /**
  * Build one model-facing tool definition.
- * @param {{ name: string, description: string, parameters: Record<string, unknown>, execute: Function }} spec - Tool spec.
+ * @param {{ name: string, description: string, parameters: Record<string, unknown>, execute: Function, timeoutMs?: number }} spec - Tool spec.
  * @returns Tool definition.
  */
 function tool(spec) {
@@ -1883,7 +1883,7 @@ function tool(spec) {
     name: spec.name,
     description: spec.description,
     parameters: spec.parameters,
-    timeoutMs: 30_000,
+    timeoutMs: spec.timeoutMs ?? 60_000,
     output: {
       schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => jsonContent(value),
@@ -2152,6 +2152,7 @@ export function apply(ctx, config) {
     }),
     tool({
       name: 'lancedb_souls',
+      timeoutMs: 180_000,
       description: '管理 soul：list 列表，create 新建，copy 复制成新 soul，rename 改名，'
         + 'merge 合并多个（来源保留），delete 连内容一起删（要 force: true）。',
       parameters: {

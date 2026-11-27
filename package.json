@@ -1,6 +1,6 @@
 {
   "name": "dsh-lancedb-memory",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": true,
   "type": "module",
   "description": "Embedded LanceDB memory for DSH: session-isolated storage, reusable souls, hybrid vector+BM25 recall",
@@ -37,7 +37,10 @@
   "scripts": {
     "check": "node --check index.js && node --check client.js",
     "test": "node test/smoke.mjs",
-    "test:edges": "node test/edges.mjs"
+    "test:edges": "node test/edges.mjs",
+    "test:fuzz": "node test/fuzz.mjs",
+    "test:concurrency": "node test/concurrency.mjs",
+    "test:all": "node test/smoke.mjs && node test/edges.mjs && node test/fuzz.mjs && node test/concurrency.mjs"
   },
   "license": "MIT",
   "author": "tbx709",
