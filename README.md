@@ -34,6 +34,15 @@ Embedded LanceDB memory for [DeepSeek Harness](https://github.com/deepseek-ai/de
 
 同时注册 Host 服务 `lancedb`，方法都显式收 scope：`store(scope, input)`、`search(scopes, input)`、`promote(sessionScope, input)` 等。
 
+## Web 界面
+
+装好后刷新页面（客户端模块只在页面加载时装配），输入框下面会出现一行 `Souls` 芯片：
+
+- 每个 soul 一个芯片，名字后面是笔记条数；亮起 = 已挂到当前会话。
+- 点一下切换挂载，效果和 agent 调 `lancedb_attach` 一样，下一次检索立刻生效。
+- 没有 soul 时显示提示，让 agent 先用 `lancedb_souls` 建一个。
+- 浏览器只走两个 owner-only 路由：`POST /api/lancedb/souls`（列表）和 `POST /api/lancedb/attach`（挂载/卸载），挂在已鉴权的 `/api` 通道上。
+
 ## 排序怎么算
 
 1. 向量检索取 `max(limit*4, 12)` 个候选，BM25 取同样多候选；两路都套 scope 和 `kind` 过滤。
@@ -106,7 +115,7 @@ pnpm install     # 拉 @lancedb/lancedb@0.41.x，原生包约 205 MB，不进仓
 装好后用 DSH 的 `plugin_manager` 安装这个目录（`install_bundle`，target 传绝对路径），
 或在 profile 的 patch 里加一条 `insert` 行，`name` 写 `dsh-lancedb-memory`。
 
-升级：`git pull && pnpm install`，然后重启 DSH —— 插件模块只在启动时加载一次。
+升级：`git pull && pnpm install`，然后重启 DSH —— 服务端模块只在启动时加载一次；只改了 `client.js` 的话刷新页面即可。
 
 ## 自测
 

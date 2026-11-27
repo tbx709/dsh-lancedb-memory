@@ -1304,6 +1304,15 @@ function round(value) {
 }
 
 /**
+ * Human-readable message for a rejected browser request.
+ * @param {unknown} error - Thrown value.
+ * @returns Message.
+ */
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
  * Check for a non-null, non-array object.
  * @param {unknown} value - Candidate.
  * @returns Whether it is a plain record.
@@ -1376,6 +1385,45 @@ export function apply(ctx, config) {
     stats: sessionScopeValue => store.stats(sessionScopeValue),
   }))
   ctx.effect(() => () => store.close())
+
+  // Browser surface: the composer's soul strip lists souls and toggles the
+  // current session's attachments. Routed through the authenticated /api
+  // carrier, so only the owner peer can read or change them.
+  ctx.inject(['connection'], (scope) => {
+    const sessionOf = async (request) => {
+      const body = await request.json().catch(() => ({}))
+      const id = typeof body.sessionId === 'string' ? body.sessionId : ''
+      if (id.length === 0) throw new Error('sessionId 缺失')
+      return { body, session: sessionScope(id) }
+    }
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/lancedb/souls',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const { session } = await sessionOf(request)
+          return Response.json(await store.soulCatalog(session))
+        } catch (error) {
+          return Response.json({ error: errorMessage(error) }, { status: 400 })
+        }
+      },
+    }))
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/lancedb/attach',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        try {
+          const { body, session } = await sessionOf(request)
+          const souls = Array.isArray(body.souls) ? body.souls : []
+          return Response.json(await store.attach(session, { souls, detach: body.detach === true }))
+        } catch (error) {
+          return Response.json({ error: errorMessage(error) }, { status: 400 })
+        }
+      },
+    }))
+  })
 
   const tools = [
     tool({

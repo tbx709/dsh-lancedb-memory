@@ -29,6 +29,7 @@ function createContext() {
   const tools = new Map()
   const services = new Map()
   const disposers = []
+  const routes = new Map()
   const ctx = {
     tools: {
       register(definition) {
@@ -46,8 +47,20 @@ function createContext() {
       if (typeof disposer === 'function') disposers.push(disposer)
       return disposer
     },
+    inject(_deps, callback) {
+      const scope = Object.create(ctx)
+      scope.connection = {
+        fetch: {
+          register(route) {
+            routes.set(route.path, route)
+            return async () => { routes.delete(route.path) }
+          },
+        },
+      }
+      callback(scope)
+    },
   }
-  return { ctx, tools, services, disposers }
+  return { ctx, tools, services, disposers, routes }
 }
 
 /**
@@ -61,6 +74,7 @@ function boot(config) {
   return {
     tools: instance.tools,
     services: instance.services,
+    routes: instance.routes,
     stop() {
       instance.disposers.forEach(dispose => dispose())
     },
@@ -154,6 +168,37 @@ try {
   catalog = await call(plugin.tools, 'lancedb_souls', { action: 'list' }, 'b')
   assert.equal(catalog.souls[0].attached, true)
   await assert.rejects(call(plugin.tools, 'lancedb_attach', { souls: ['nope'] }, 'b'), /不存在/u)
+
+  // --- Browser routes behind the authenticated /api carrier ---------------
+  const soulsRoute = plugin.routes.get('/api/lancedb/souls')
+  const attachRoute = plugin.routes.get('/api/lancedb/attach')
+  assert.ok(soulsRoute, 'souls route is registered')
+  assert.ok(attachRoute, 'attach route is registered')
+
+  const routePost = (route, body) => route.fetch(new Request('http://host/api/lancedb', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  }))
+
+  const soulsAnswer = await routePost(soulsRoute, { sessionId: 'ui' })
+  assert.equal(soulsAnswer.status, 200)
+  const soulsBody = await soulsAnswer.json()
+  assert.equal(soulsBody.souls[0].name, 'writing')
+  assert.equal(soulsBody.souls[0].attached, false)
+  assert.deepEqual(soulsBody.attached, [])
+
+  const attachAnswer = await routePost(attachRoute, { sessionId: 'ui', souls: ['writing'] })
+  assert.deepEqual((await attachAnswer.json()).attached, ['writing'])
+  const afterAttach = await (await routePost(soulsRoute, { sessionId: 'ui' })).json()
+  assert.equal(afterAttach.souls[0].attached, true)
+
+  const detachAnswer = await routePost(attachRoute, { sessionId: 'ui', souls: ['writing'], detach: true })
+  assert.deepEqual((await detachAnswer.json()).attached, [])
+  const missingSession = await routePost(soulsRoute, {})
+  assert.equal(missingSession.status, 400)
+  const unknownSoul = await routePost(attachRoute, { sessionId: 'ui', souls: ['nope'] })
+  assert.equal(unknownSoul.status, 400)
 
   // --- Promote from a session into a soul ---------------------------------
   const draft = await call(plugin.tools, 'lancedb_store', {
